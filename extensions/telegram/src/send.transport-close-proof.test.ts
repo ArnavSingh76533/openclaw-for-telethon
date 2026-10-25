@@ -1,4 +1,4 @@
-import type { Socket } from "node:net";
+import "./telethon-ipc.test-support.js";
 import { Bot } from "grammy";
 import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
@@ -231,20 +231,12 @@ describe("Telegram request contracts through real clients", () => {
   });
 });
 
-describe("telegram transport cache eviction over real sockets", () => {
+describe("Telegram transport cache request retirement through IPC", () => {
   const fixture = useTelegramHttpFixture();
-  const { sockets: liveSockets, requestSockets } = fixture;
 
-  it("closes evicted and reset transports", async () => {
+  it("cancels evicted and reset callers while their shared service remains usable", async () => {
     resetTelegramClientOptionsCacheForTests();
-    const ACCOUNTS = 70;
-    let sendMessageCalls = 0;
-    fixture.responseFor = (method) => {
-      if (method === "sendMessage" || method === "editMessageText") {
-        return { message_id: ++sendMessageCalls, chat: { id: 123 } };
-      }
-      return method === "getChat" ? { id: 123, type: "private" } : true;
-    };
+    const ACCOUNTS = 65;
     const accounts = Object.fromEntries(
       Array.from({ length: ACCOUNTS }, (_, i) => [
         `acct-${i}`,
@@ -252,26 +244,52 @@ describe("telegram transport cache eviction over real sockets", () => {
       ]),
     );
     const cfg = { channels: { telegram: { accounts } } };
-    const send = async (account: number) => {
-      await editMessageTelegram("123", 1, "preview", { cfg, accountId: `acct-${account}` });
-      const socket = requestSockets.get(`/bot10${account}:e2e-token-${account}`);
-      if (!socket) {
-        throw new Error(`Telegram socket for acct-${account} was not captured`);
+    const edit = (account: number, text = "preview") =>
+      editMessageTelegram("123", 1, text, { cfg, accountId: `acct-${account}` });
+    const observe = (pending: ReturnType<typeof edit>) =>
+      pending.then(
+        () => ({ ok: true }),
+        (error: unknown) => ({ error }),
+      );
+    fixture.handleRequest = (method, fields) =>
+      method === "editMessageText" && String(fields.text).startsWith("held-");
+    const evicted = observe(edit(0, "held-eviction"));
+    let reset: ReturnType<typeof observe> | undefined;
+    try {
+      await vi.waitFor(() =>
+        expect(fixture.requests.some(({ fields }) => fields.text === "held-eviction")).toBe(true),
+      );
+      const evictedSocket = fixture.requestSockets.get("/bot100:e2e-token-0");
+      expect(evictedSocket).toBeDefined();
+      for (let i = 1; i < ACCOUNTS; i += 1) {
+        await edit(i);
       }
-      return socket;
-    };
-    const sockets: Socket[] = [];
-    for (let i = 0; i < ACCOUNTS; i += 1) {
-      sockets.push(await send(i));
-      if (i >= 64) {
-        await vi.waitFor(() => expect(liveSockets).not.toContain(sockets[i - 64]), {
-          timeout: 3000,
-        });
-      }
+      await expect(evicted).resolves.toMatchObject({
+        error: { error: { message: "Telegram transport closed" } },
+      });
+      await vi.waitFor(() => expect(evictedSocket?.destroyed).toBe(true));
+      await edit(0);
+
+      reset = observe(edit(64, "held-reset"));
+      await vi.waitFor(() =>
+        expect(fixture.requests.some(({ fields }) => fields.text === "held-reset")).toBe(true),
+      );
+      const resetSocket = fixture.requestSockets.get("/bot1064:e2e-token-64");
+      expect(resetSocket).toBeDefined();
+      resetTelegramClientOptionsCacheForTests();
+      await expect(reset).resolves.toMatchObject({
+        error: { error: { message: "Telegram transport closed" } },
+      });
+      await vi.waitFor(() => expect(resetSocket?.destroyed).toBe(true));
+      await edit(64);
+      expect(
+        fixture.endpoints.filter(
+          (endpoint) => endpoint === "/bot1064:e2e-token-64/editMessageText",
+        ),
+      ).toHaveLength(3);
+    } finally {
+      resetTelegramClientOptionsCacheForTests();
+      await Promise.allSettled([evicted, reset]);
     }
-    expect(sendMessageCalls).toBe(ACCOUNTS);
-    resetTelegramClientOptionsCacheForTests();
-    await vi.waitFor(() => expect(liveSockets.size).toBe(0), { timeout: 3000 });
-    expect(await send(6)).not.toBe(sockets[6]);
   });
 });

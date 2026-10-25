@@ -1,5 +1,7 @@
 # Telegram
 
+This version uses Python + Telethon for Telegram communication. Install the Python runtime and set its API credentials as described in [TELETHON.md](./TELETHON.md) before starting the existing OpenClaw plugin.
+
 Talk to OpenClaw through a Telegram bot in direct messages, groups, channels, and
 topics. The plugin supports media, voice notes, reactions, polls, and native
 commands.

@@ -37,6 +37,7 @@ import {
   type TelegramIngressWorkerMessage,
   type TelegramIngressWorkerOptions,
 } from "./telegram-ingress-worker.js";
+import { createTelethonIpcFixture } from "./telethon-ipc.test-support.js";
 import { createTestLifetime } from "./test-lifetime.test-support.js";
 import { createTelegramUpdateOffsetPersistence } from "./update-offset-persistence.js";
 
@@ -654,6 +655,8 @@ describe("TelegramPollingSession", () => {
         });
       });
       const apiRoot = await listen(server);
+      const ipc = createTelethonIpcFixture(apiRoot);
+      await ipc.listenForToken("tok");
       const createWorker: NonNullable<IsolatedIngressOptions["createWorker"]> = (options) => {
         const { worker, task } = startRuntimeWorker({ ...options, apiRoot }, advancedOffset);
         const handle: ReturnType<NonNullable<IsolatedIngressOptions["createWorker"]>> = {
@@ -685,6 +688,7 @@ describe("TelegramPollingSession", () => {
         try {
           await runPromise;
         } finally {
+          await ipc.close();
           await closeServer(server);
         }
       });
@@ -1005,6 +1009,8 @@ describe("TelegramPollingSession", () => {
       });
       const apiRoot = await listen(server);
 
+      const ipc = createTelethonIpcFixture(apiRoot);
+      await ipc.listenForToken("tok");
       const abort = new AbortController();
       const log = vi.fn();
       const watchdogHarness = installPollingStallWatchdogHarness();
@@ -1075,6 +1081,7 @@ describe("TelegramPollingSession", () => {
         abort.abort();
         await runPromise.catch(() => undefined);
         await actualWorker?.terminate();
+        await ipc.close();
         await closeServer(server);
       }
     });

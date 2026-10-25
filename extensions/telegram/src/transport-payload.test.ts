@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import type { Message } from "grammy/types";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

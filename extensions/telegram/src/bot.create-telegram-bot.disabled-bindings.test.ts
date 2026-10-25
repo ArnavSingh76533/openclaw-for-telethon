@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createPluginStateSyncKeyedStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { dispatchInboundMessage, resetInboundDedupe } from "openclaw/plugin-sdk/reply-runtime";

@@ -6,7 +6,9 @@ const workerHarness = await vi.hoisted(async () => {
   const { EventEmitter } = await import("node:events");
   const instances: MockWorker[] = [];
   class MockWorker extends EventEmitter {
-    postMessage = vi.fn();
+    readonly postMessageSpy = vi.fn();
+    // CPU tracking wraps postMessage; retain the actual underlying recorder.
+    postMessage = this.postMessageSpy;
     terminate = vi.fn(async () => 1);
     constructor(
       public url: URL,
@@ -72,7 +74,7 @@ describe("stopTelegramIngressWorker", () => {
       await vi.advanceTimersByTimeAsync(1);
       await stopping;
     }
-    expect(worker.postMessage).toHaveBeenCalledWith({ type: "stop" }, []);
+    expect(worker.postMessageSpy).toHaveBeenCalledWith({ type: "stop" }, []);
     expect(worker.terminate).toHaveBeenCalledTimes(cooperative ? 0 : 1);
   });
 });

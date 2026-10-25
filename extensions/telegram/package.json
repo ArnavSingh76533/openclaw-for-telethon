@@ -33,6 +33,15 @@
     ],
     "setupEntry": "./setup-entry.ts",
     "build": {
+      "staticAssets": [
+        { "source": "python/pyproject.toml", "output": "python/pyproject.toml" },
+        { "source": "python/openclaw_telethon/__init__.py", "output": "python/openclaw_telethon/__init__.py" },
+        { "source": "python/openclaw_telethon/__main__.py", "output": "python/openclaw_telethon/__main__.py" },
+        { "source": "python/openclaw_telethon/service.py", "output": "python/openclaw_telethon/service.py" },
+        { "source": "python/openclaw_telethon/store.py", "output": "python/openclaw_telethon/store.py" },
+        { "source": "python/openclaw_telethon/codec.py", "output": "python/openclaw_telethon/codec.py" },
+        { "source": "python/openclaw_telethon/methods.py", "output": "python/openclaw_telethon/methods.py" }
+      ],
       "workerEntries": [
         "./src/telegram-ingress-worker.runtime.ts"
       ]
@@ -53,7 +62,7 @@
         "native"
       ],
       "label": "Telegram",
-      "selectionLabel": "Telegram (Bot API)",
+      "selectionLabel": "Telegram (Telethon / MTProto)",
       "detailLabel": "Telegram Bot",
       "docsPath": "/channels/telegram",
       "docsLabel": "telegram",

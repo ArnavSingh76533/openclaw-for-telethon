@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-telethon"
+version = "0.1.0"
+description = "OpenClaw Telegram MTProto transport worker"
+requires-python = ">=3.9"
+dependencies = ["Telethon==1.45.0", "aiohttp>=3.10,<4", "python-socks[asyncio]>=2.4,<3", "hachoir>=3.3,<4"]
+
+[project.scripts]
+openclaw-telethon = "openclaw_telethon.service:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openclaw_telethon*"]

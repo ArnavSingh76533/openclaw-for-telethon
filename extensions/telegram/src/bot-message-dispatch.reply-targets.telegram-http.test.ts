@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";

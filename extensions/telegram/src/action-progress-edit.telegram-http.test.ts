@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
 import type { ChannelProgressDraftCompositorSnapshot } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";

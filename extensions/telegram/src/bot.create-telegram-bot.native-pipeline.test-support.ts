@@ -172,7 +172,12 @@ export async function createBot(
   inbound.debounceMs ??= 0;
   publishTelegramTestConfig(cfg);
   const abort = new AbortController();
-  const token = resolveTelegramAccount({ cfg, accountId }).token;
+  const account = resolveTelegramAccount({ cfg, accountId });
+  const token = account.token;
+  // Nested fixtures prepare their own API root; do not claim their Python listener.
+  if (account.config.apiRoot === http.cfg.channels.telegram.apiRoot) {
+    await http.listenForToken(token);
+  }
   // Routing and delivery assertions retain real scheduling without wall-clock pacing.
   getOrCreateAccountThrottler(token, () =>
     apiThrottler({

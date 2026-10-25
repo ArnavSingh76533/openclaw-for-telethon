@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 // Real grammY command handling and SQLite ingress, with a loopback Telegram API.
 import type { ServerResponse } from "node:http";
 import path from "node:path";

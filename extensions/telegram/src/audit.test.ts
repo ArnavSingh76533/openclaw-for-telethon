@@ -1,14 +1,10 @@
 import "openclaw/plugin-sdk/compiled-subprocess-testing";
-import { Agent } from "undici/index.js";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { auditTelegramGroupMembership, collectTelegramUnmentionedGroupIds } from "./audit.js";
 
 const rawFetch = vi.hoisted(() => vi.fn<typeof fetch>());
-vi.mock("undici/index.js", async () => ({
-  ...(await vi.importActual<typeof import("undici")>("undici/index.js")),
-  fetch: rawFetch,
-}));
-const requests: Array<{ wire: string; dispatcher: Agent }> = [];
+vi.mock("./telethon-transport.js", () => ({ createTelethonFetch: () => rawFetch }));
+const requests: Array<{ wire: string; signal: AbortSignal }> = [];
 const membership = (status = "member") => Response.json({ ok: true, result: { status } });
 const expectedRequests = (...chatIds: string[]) =>
   chatIds.map(
@@ -33,21 +29,20 @@ beforeEach(() => {
     vi.stubEnv(key, undefined);
   }
   rawFetch.mockReset().mockImplementation(async (input, init) => {
-    const dispatcher = (init as RequestInit & { dispatcher?: unknown })?.dispatcher;
-    if (!(dispatcher instanceof Agent)) {
-      throw new Error("Membership audit did not provide its owned Agent");
+    const signal = init?.signal;
+    if (!(signal instanceof AbortSignal)) {
+      throw new Error("Membership audit did not provide its owned cancellation signal");
     }
     const request = new Request(input, init);
     requests.push({
       wire: `${request.method} ${request.url}\n${await request.text()}`,
-      dispatcher,
+      signal,
     });
-    expect(dispatcher.destroyed).toBe(false);
+    expect(signal.aborted).toBe(false);
     return respond();
   });
 });
-afterEach(async () => {
-  await Promise.allSettled(requests.map(({ dispatcher }) => dispatcher.destroy()));
+afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   vi.unstubAllEnvs();
@@ -122,7 +117,7 @@ it.each(["network failure", "malformed JSON"] as const)(
     };
     expect(await auditGroups()).toMatchObject({ ok: false, checkedGroups: 1 });
     expect(requests.map(({ wire }) => wire)).toEqual(expectedRequests("-1001"));
-    expect(requests[0]?.dispatcher.destroyed).toBe(true);
+    expect(requests[0]?.signal.aborted).toBe(true);
   },
 );
 
@@ -149,8 +144,7 @@ it("keeps the audit transport open until the final group's response body settles
   try {
     await readingBody.promise;
     expect(requests.map(({ wire }) => wire)).toEqual(expectedRequests("-1001", "-1002"));
-    expect(requests[0]?.dispatcher).toBe(requests[1]?.dispatcher);
-    expect(requests[1]?.dispatcher.destroyed).toBe(false);
+    expect(requests.every(({ signal }) => !signal.aborted)).toBe(true);
   } finally {
     finishBody.resolve();
   }
@@ -162,5 +156,5 @@ it("keeps the audit transport open until the final group's response body settles
       { chatId: "-1002", status: "administrator" },
     ],
   });
-  expect(requests[1]?.dispatcher.destroyed).toBe(true);
+  expect(requests.every(({ signal }) => signal.aborted)).toBe(true);
 });

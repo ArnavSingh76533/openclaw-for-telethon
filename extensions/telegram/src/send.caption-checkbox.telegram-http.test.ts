@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { describe, expect, it } from "vitest";
 import { sendMessageTelegram } from "./send.js";
 import { useTelegramHttpFixture } from "./send.telegram-http.test-support.js";

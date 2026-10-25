@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import { sendDurableMessageBatch } from "openclaw/plugin-sdk/channel-outbound";
 import * as configMutation from "openclaw/plugin-sdk/config-mutation";
@@ -302,13 +303,15 @@ describe("Telegram physical send acceptance over HTTP", () => {
   });
 
   it.each([
+    { failure: "misdirected", revoke: false },
     { failure: "misdirected", revoke: true },
     { failure: "connection", revoke: false },
     { failure: "connection", revoke: true },
   ] as const)(
-    "checks pin authority through $failure fallback (revoked: $revoke)",
+    "preserves pin retry authority after $failure settlement (revoked: $revoke)",
     async ({ failure, revoke }) => {
-      // Each control needs a fresh transport with an available fallback path.
+      // An explicit API rejection retains the host's authorized pin retry.
+      // An uncertain IPC disconnect must never replay the accepted request.
       resetTelegramClientOptionsCacheForTests();
       const held = { arrived: createDeferred<void>(), release: createDeferred<void>() };
       fixture.requestHold = held;
@@ -336,10 +339,22 @@ describe("Telegram physical send acceptance over HTTP", () => {
         ]);
         current = !revoke;
         held.release.resolve();
-        expect(await outcome).toEqual(revoke ? { error: revoked } : { ok: true });
-        expect(requests.map(({ method, fields }) => [method, fields.message_id])).toEqual(
-          Array.from({ length: revoke ? 1 : 2 }, () => ["pinChatMessage", 401]),
-        );
+        const result = await outcome;
+        if (failure === "misdirected") {
+          expect(result).toEqual(revoke ? { error: revoked } : { ok: true });
+          expect(requests.map(({ method, fields }) => [method, fields.message_id])).toEqual(
+            Array.from({ length: revoke ? 1 : 2 }, () => ["pinChatMessage", 401]),
+          );
+          return;
+        }
+        expect(result).toHaveProperty("error");
+        if (!("error" in result)) {
+          throw new Error("Expected the failed exchange to remain visible");
+        }
+        expect(result.error).toBeInstanceOf(Error);
+        expect(requests.map(({ method, fields }) => [method, fields.message_id])).toEqual([
+          ["pinChatMessage", 401],
+        ]);
       } finally {
         held.release.resolve();
         await outcome;

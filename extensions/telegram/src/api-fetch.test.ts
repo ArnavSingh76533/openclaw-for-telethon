@@ -27,10 +27,7 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-vi.mock("undici/index.js", async () => {
-  const actual = await vi.importActual<typeof import("undici")>("undici/index.js");
-  return { ...actual, fetch: proxyMocks.undiciFetch };
-});
+vi.mock("./telethon-transport.js", () => ({ createTelethonFetch: () => proxyMocks.undiciFetch }));
 
 describe("fetchTelegramChatId", () => {
   it("returns null for oversized getChat JSON responses and cancels the stream", async () => {
@@ -122,9 +119,7 @@ it.each(["success", "transport failure"])(
       }),
     ).resolves.toBe(expected);
 
-    const init = proxyMocks.undiciFetch.mock.calls[0]?.[1] as
-      | (RequestInit & { dispatcher?: { destroyed?: boolean } })
-      | undefined;
-    expect(init?.dispatcher?.destroyed).toBe(true);
+    const init = proxyMocks.undiciFetch.mock.calls[0]?.[1] as RequestInit | undefined;
+    expect(init?.signal?.aborted).toBe(true);
   },
 );

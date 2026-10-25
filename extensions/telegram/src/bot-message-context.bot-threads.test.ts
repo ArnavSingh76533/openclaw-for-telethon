@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Bot } from "grammy";

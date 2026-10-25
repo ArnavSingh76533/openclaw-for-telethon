@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import path from "node:path";
 import type { OpenClawConfig, TelegramAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";

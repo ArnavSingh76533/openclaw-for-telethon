@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -114,12 +115,20 @@ async function withApi(
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", resolve);
   });
+  const apiRoot = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const { createTelethonIpcFixture } = await import("./telethon-ipc.test-support.js");
+  const ipc = createTelethonIpcFixture(apiRoot);
   try {
-    await run(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests);
+    await ipc.listenForToken(TOKEN);
+    await run(apiRoot, requests);
   } finally {
-    server.close();
-    server.closeAllConnections();
-    server.unref();
+    try {
+      await ipc.close();
+    } finally {
+      server.close();
+      server.closeAllConnections();
+      server.unref();
+    }
   }
 }
 

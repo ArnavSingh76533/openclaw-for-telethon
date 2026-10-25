@@ -55,7 +55,7 @@ export async function fetchTelegramChatId(params: {
 }): Promise<string | null> {
   const apiBase = resolveTelegramApiBase(params.apiRoot);
   const url = `${apiBase}/bot${params.token}/getChat?chat_id=${encodeURIComponent(params.chatId)}`;
-  const fetchImpl = params.fetchImpl ?? fetch;
+  const fetchImpl = params.fetchImpl ?? resolveTelegramFetch();
   const requestAbortController = new AbortController();
   const requestSignal = params.signal
     ? AbortSignal.any([params.signal, requestAbortController.signal])

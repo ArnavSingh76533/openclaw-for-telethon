@@ -1,3 +1,4 @@
+import "../telethon-ipc.test-support.js";
 import type * as Dns from "node:dns/promises";
 import { readFile, writeFile } from "node:fs/promises";
 import { Bot, Context } from "grammy";

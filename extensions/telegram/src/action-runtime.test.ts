@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import path from "node:path";
 import type { Message } from "grammy/types";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";

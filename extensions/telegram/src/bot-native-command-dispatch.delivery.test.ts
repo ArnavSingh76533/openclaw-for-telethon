@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";

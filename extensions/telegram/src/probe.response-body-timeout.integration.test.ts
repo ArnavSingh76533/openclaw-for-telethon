@@ -1,17 +1,25 @@
+import { createHash } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
+import path from "node:path";
+import { buffer } from "node:stream/consumers";
+import { extractErrorCode } from "openclaw/plugin-sdk/error-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import * as responseLimitRuntime from "openclaw/plugin-sdk/response-limit-runtime";
 import * as runtimeEnv from "openclaw/plugin-sdk/runtime-env";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { probeTelegram } from "./probe.js";
+import { createTelethonFetch } from "./telethon-transport.js";
+
+const TOKEN = "123456:probe-socket-fixture";
 
 const INITIAL_BODY = '{"ok":true,"result":{"id":123';
 
 describe("probeTelegram cancellation and body deadlines over real sockets", () => {
   let server: Server;
   let apiRoot: string;
-  let mode: "backoff" | "all" | "webhook" | "stall" | "trickle" | "webhook-body";
+  let mode: "ready" | "backoff" | "all" | "webhook" | "stall" | "trickle" | "webhook-body";
   let pendingResponse: ServerResponse;
   let socketClosed = createDeferred<void>();
   let requestStarted = createDeferred<void>();
@@ -26,41 +34,119 @@ describe("probeTelegram cancellation and body deadlines over real sockets", () =
       vi.stubEnv(name, "");
     }
 
+    vi.stubEnv("TELEGRAM_API_ID", "12345");
+    vi.stubEnv("TELEGRAM_API_HASH", "synthetic-probe-socket-fixture");
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const stateDir = path.resolve(
+      resolveStateDir(),
+      "telegram",
+      "telethon",
+      digest(TOKEN).slice(0, 24),
+    );
+    const identity = digest(
+      `${stateDir}\0${process.env.TELEGRAM_API_ID}\0${process.env.TELEGRAM_API_HASH}\0`,
+    );
+    const secret = digest(`${identity}\0${TOKEN}\0openclaw-telethon-ipc-v1`);
+    // Fault the Python IPC socket itself: diagnostics must retain deadlines
+    // and cancellation even when the local worker stalls or truncates JSON.
     server = createServer((request, response) => {
-      requestCount += 1;
-      if (mode === "backoff") {
-        response.socket?.destroy();
+      response.setHeader("connection", "close");
+      if (request.headers["x-openclaw-telethon"] !== secret) {
+        response.writeHead(401).end();
         return;
       }
-      if (mode === "all" || (mode === "webhook" && request.url?.endsWith("/getWebhookInfo"))) {
-        requestStarted.resolve();
-        return;
-      }
-      response.writeHead(200, { "content-type": "application/json" });
-      if ((mode === "webhook" || mode === "webhook-body") && request.url?.endsWith("/getMe")) {
+      if (request.url === "/health") {
+        response.setHeader("content-type", "application/json");
         response.end(
-          '{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Test","username":"bot"}}',
+          JSON.stringify({
+            ok: true,
+            result: { protocol: "openclaw-telethon", version: 1, ready: true },
+          }),
         );
         return;
       }
-      const closed = socketClosed;
-      request.socket.once("close", () => closed.resolve());
-      response.write(
-        mode === "webhook-body"
-          ? '{"ok":true,"result":{"url":"https://example.test/hook"'
-          : INITIAL_BODY,
-      );
-      pendingResponse = response;
+      if (request.url !== "/rpc") {
+        response.writeHead(404).end();
+        return;
+      }
+      requestCount += 1;
+      connectionCount += 1;
+      void buffer(request)
+        .then((body) => {
+          const { method } = JSON.parse(body.toString("utf8")) as { method: string };
+          if (mode === "backoff") {
+            response.socket?.destroy();
+            return;
+          }
+          if (mode === "all" || (mode === "webhook" && method === "getWebhookInfo")) {
+            requestStarted.resolve();
+            return;
+          }
+          response.writeHead(200, { "content-type": "application/json" });
+          if (
+            mode === "ready" ||
+            ((mode === "webhook" || mode === "webhook-body") && method === "getMe")
+          ) {
+            response.end(
+              '{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"Test","username":"bot"}}',
+            );
+            return;
+          }
+          const closed = socketClosed;
+          request.socket.once("close", () => closed.resolve());
+          response.write(
+            mode === "webhook-body"
+              ? '{"ok":true,"result":{"url":"https://example.test/hook"'
+              : INITIAL_BODY,
+          );
+          pendingResponse = response;
+        })
+        .catch((cause: unknown) =>
+          response.destroy(cause instanceof Error ? cause : new Error(String(cause))),
+        );
     });
     server.on("connection", (socket) => {
-      connectionCount += 1;
       liveSockets.add(socket);
       socket.once("close", () => liveSockets.delete(socket));
     });
-    await new Promise<void>((resolve) => {
-      server.listen(0, "127.0.0.1", resolve);
-    });
+    const seed = Number.parseInt(identity.slice(0, 8), 16);
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(20_000 + ((seed + attempt * 7_919) % 40_000), "127.0.0.1", () => {
+            server.removeListener("error", reject);
+            resolve();
+          });
+        });
+        break;
+      } catch (cause) {
+        if (!["EACCES", "EADDRINUSE"].includes(extractErrorCode(cause) ?? "")) {
+          throw cause;
+        }
+      }
+    }
+    if (!server.listening) {
+      throw new Error("No free probe IPC fixture port");
+    }
     apiRoot = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    // Complete service discovery before fake-clock cases; only RPC sockets
+    // contribute to the existing request/connection assertions.
+    mode = "ready";
+    await (await createTelethonFetch()(`${apiRoot}/bot${TOKEN}/getMe`)).json();
+    requestCount = 0;
+    connectionCount = 0;
+  });
+
+  beforeEach(() => {
+    // Vitest restores suite-level stubs before each case.
+    vi.stubEnv("TELEGRAM_API_ID", "12345");
+    vi.stubEnv("TELEGRAM_API_HASH", "synthetic-probe-socket-fixture");
+    for (const name of "HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy OPENCLAW_PROXY_URL OPENCLAW_DEBUG_PROXY_ENABLED OPENCLAW_DEBUG_PROXY_URL OPENCLAW_TELETHON_PROXY".split(
+      " ",
+    )) {
+      vi.stubEnv(name, "");
+    }
   });
 
   afterAll(async () => {
@@ -75,7 +161,6 @@ describe("probeTelegram cancellation and body deadlines over real sockets", () =
     });
   });
 
-  let probeIndex = 0;
   const beforeProbeEnds = <T>(milestone: Promise<T>, probe: Promise<unknown>) =>
     Promise.race([
       milestone,
@@ -102,7 +187,7 @@ describe("probeTelegram cancellation and body deadlines over real sockets", () =
         : undefined;
     mode = phase;
     const startedAt = Date.now();
-    const probe = probeTelegram(`abort-${phase}-token`, 10_000, {
+    const probe = probeTelegram(TOKEN, 10_000, {
       apiRoot,
       includeWebhookInfo: phase === "webhook",
       abortSignal: controller.signal,
@@ -183,7 +268,7 @@ describe("probeTelegram cancellation and body deadlines over real sockets", () =
       },
     );
     const abort = new AbortController();
-    const probe = probeTelegram(`deadline-${bodyMode}-${++probeIndex}`, 200, {
+    const probe = probeTelegram(TOKEN, 200, {
       apiRoot,
       includeWebhookInfo: false,
       abortSignal: abort.signal,
@@ -214,7 +299,7 @@ describe("probeTelegram cancellation and body deadlines over real sockets", () =
     socketClosed = createDeferred<void>();
     const previousRequestCount = requestCount;
 
-    const result = await probeTelegram(`deadline-webhook-${++probeIndex}`, 200, { apiRoot });
+    const result = await probeTelegram(TOKEN, 200, { apiRoot });
 
     expect(result).toMatchObject({ ok: true, bot: { id: 123, username: "bot" } });
     expect(result.webhook).toBeUndefined();

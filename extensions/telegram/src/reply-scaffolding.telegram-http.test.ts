@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { buildHistoryContext } from "openclaw/plugin-sdk/reply-history";
 import { createReplyDispatcher, dispatchInboundMessage } from "openclaw/plugin-sdk/reply-runtime";
 import { describe, expect, it } from "vitest";

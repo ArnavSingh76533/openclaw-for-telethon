@@ -10,8 +10,11 @@ import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { captureEnv } from "openclaw/plugin-sdk/test-env";
 import { afterAll, beforeAll, beforeEach } from "vitest";
 import { deliverReplies } from "./bot/delivery.js";
+import { asTelegramClientFetch, createTelegramClientFetch } from "./client-fetch.js";
+import { resolveTelegramTransport, type TelegramTransport } from "./fetch.js";
 import { createTelegramOutboundAdapter } from "./outbound-adapter.js";
 import { resetTelegramClientOptionsCacheForTests, sendMessageTelegram } from "./send.js";
+import { createTelethonIpcFixture } from "./telethon-ipc.test-support.js";
 
 export function resolveTelegramTestUpload(fields: Record<string, unknown>, key: string): File {
   const reference = fields[key];
@@ -66,6 +69,8 @@ class TelegramHttpState {
 
 export function useTelegramHttpFixture() {
   let server: Server;
+  let ipc: ReturnType<typeof createTelethonIpcFixture>;
+  let transport: TelegramTransport;
   const state = new TelegramHttpState();
   let env: ReturnType<typeof captureEnv> | undefined;
   const { cfg, requests, requestSockets, rejections, buttons, runtime } = state;
@@ -211,8 +216,19 @@ export function useTelegramHttpFixture() {
       server.listen(0, "127.0.0.1", resolve);
     });
     cfg.channels.telegram.apiRoot = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    ipc = createTelethonIpcFixture(cfg.channels.telegram.apiRoot);
+    await ipc.listenForToken(cfg.channels.telegram.botToken);
+    transport = resolveTelegramTransport();
     state.bot = new Bot(cfg.channels.telegram.botToken, {
-      client: { apiRoot: cfg.channels.telegram.apiRoot },
+      client: {
+        apiRoot: cfg.channels.telegram.apiRoot,
+        fetch: asTelegramClientFetch(
+          createTelegramClientFetch({
+            fetchImpl: asTelegramClientFetch(transport.fetch),
+            transport,
+          }),
+        ),
+      },
     });
   });
 
@@ -229,6 +245,8 @@ export function useTelegramHttpFixture() {
   afterAll(async () => {
     try {
       resetTelegramClientOptionsCacheForTests();
+      await transport.close();
+      await ipc.close();
       for (const socket of state.sockets) {
         socket.destroy();
       }
@@ -307,6 +325,7 @@ export function useTelegramHttpFixture() {
     messageId: number,
     assertDirectAdapterHandoff?: () => void,
   ) {
+    await ipc.listenForToken(token);
     await state.telegramOutbound.pinDeliveredMessage!({
       cfg: config({ botToken: token }),
       target: { channel: "telegram", to: "123", accountId: "default" },
@@ -316,5 +335,9 @@ export function useTelegramHttpFixture() {
     });
   }
 
-  return Object.assign(state, { sendThrough, pinThroughAdapter });
+  return Object.assign(state, {
+    sendThrough,
+    pinThroughAdapter,
+    listenForToken: (token: string) => ipc.listenForToken(token),
+  });
 }

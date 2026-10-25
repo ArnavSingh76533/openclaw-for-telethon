@@ -11,6 +11,7 @@ import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
 import { TelegramBotApiFileTooLargeError } from "../bot-handlers.media.js";
 import {
   resolveTelegramApiBase,
+  resolveTelegramFetch,
   shouldRetryTelegramTransportFallback,
   type TelegramTransport,
 } from "../fetch.js";
@@ -301,7 +302,7 @@ export async function resolveMedia(params: {
       );
     }
     const transport = downloadOptions.transport;
-    const fetchImpl = transport ? transport.sourceFetch : globalThis.fetch;
+    const fetchImpl = transport ? transport.sourceFetch : resolveTelegramFetch();
     if (!transport && !fetchImpl) {
       throw new Error("fetch is not available; set channels.telegram.proxy in config");
     }

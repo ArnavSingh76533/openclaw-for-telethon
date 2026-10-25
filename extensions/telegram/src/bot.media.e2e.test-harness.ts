@@ -361,26 +361,14 @@ vi.doMock("./bot.runtime.js", () => ({
   ...telegramBotRuntimeForTest,
 }));
 
-vi.mock("undici/index.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("undici")>();
-  return {
-    ...actual,
-    Agent: vi.fn(function MockAgent(this: { options?: unknown }, options?: unknown) {
-      this.options = options;
-    }),
-    EnvHttpProxyAgent: vi.fn(function MockEnvHttpProxyAgent(
-      this: { options?: unknown },
-      options?: unknown,
-    ) {
-      this.options = options;
-    }),
-    ProxyAgent: vi.fn(function MockProxyAgent(this: { options?: unknown }, options?: unknown) {
-      this.options = options;
-    }),
-    fetch: (...args: Parameters<typeof undiciFetchSpy>) => undiciFetchSpy(...args),
-    setGlobalDispatcher: vi.fn(),
-  };
-});
+// Retain the media harness's existing response spy at the new transport seam.
+// Host media/context assertions stay independent of Python's network service.
+vi.mock("./telethon-transport.js", () => ({
+  createTelethonFetch:
+    () =>
+    (...args: Parameters<typeof undiciFetchSpy>) =>
+      undiciFetchSpy(...args),
+}));
 
 vi.mock("openclaw/plugin-sdk/media-runtime", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/media-runtime")>()),

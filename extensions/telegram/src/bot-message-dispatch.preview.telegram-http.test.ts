@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { projectAgentToolActivity } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { PluginHookReplyPayloadSendingEvent } from "openclaw/plugin-sdk/core";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";

@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import path from "node:path";
 import type { PluginHookReplyPayloadSendingEvent } from "openclaw/plugin-sdk/core";
 import {

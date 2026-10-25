@@ -30,11 +30,14 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, vi } from "vitest";
 import type { TelegramMessageContext } from "./bot-message-context.js";
 import { dispatchTelegramMessage } from "./bot-message-dispatch.js";
 import { telegramPlugin } from "./channel.js";
+import { asTelegramClientFetch, createTelegramClientFetch } from "./client-fetch.js";
+import { resolveTelegramTransport, type TelegramTransport } from "./fetch.js";
 import { setTelegramPluginStateRuntimeForTests } from "./runtime-state.test-support.js";
 import {
   clearTelegramRuntimeForTest,
   resetTelegramAccountThrottlersForTest,
 } from "./runtime.test-support.js";
+import { createTelethonIpcFixture } from "./telethon-ipc.test-support.js";
 
 type RecordedBotApiCall = { method: string; fields: Record<string, unknown> };
 type ReplyResolver = NonNullable<Parameters<typeof dispatchInboundMessage>[0]["replyResolver"]>;
@@ -98,6 +101,8 @@ export function createTelegramDispatchHttpFixture() {
   let apiRoot: string;
   let state: OpenClawTestState;
   let bot: Bot;
+  let ipc: ReturnType<typeof createTelethonIpcFixture>;
+  let transport: TelegramTransport;
   let nextMessageId = 0;
   let inboundSequence = 0;
   const calls: RecordedBotApiCall[] = [];
@@ -254,6 +259,8 @@ export function createTelegramDispatchHttpFixture() {
     vi.stubEnv("NO_PROXY", "127.0.0.1,localhost,::1");
     vi.stubEnv("no_proxy", "127.0.0.1,localhost,::1");
     state = await createOpenClawTestState({ label: "telegram-dispatch-http" });
+    ipc = createTelethonIpcFixture(apiRoot);
+    await ipc.listenForToken(BOT_TOKEN);
     const append = transcriptRuntime.appendAssistantMirrorMessageByIdentity;
     const observer = vi
       .spyOn(transcriptRuntime, "appendAssistantMirrorMessageByIdentity")
@@ -267,7 +274,18 @@ export function createTelegramDispatchHttpFixture() {
     stopped = createDeferred<never>();
     void stopped.promise.catch(() => undefined);
     resetTelegramAccountThrottlersForTest();
-    bot = new Bot(BOT_TOKEN, { client: { apiRoot } });
+    transport = resolveTelegramTransport();
+    bot = new Bot(BOT_TOKEN, {
+      client: {
+        apiRoot,
+        fetch: asTelegramClientFetch(
+          createTelegramClientFetch({
+            fetchImpl: asTelegramClientFetch(transport.fetch),
+            transport,
+          }),
+        ),
+      },
+    });
     const requestLifetime = lifetime.signal;
     bot.api.config.use(async (previous, method, payload, signal) => {
       requestLifetime.throwIfAborted();
@@ -321,6 +339,7 @@ export function createTelegramDispatchHttpFixture() {
   afterEach(async () => {
     const ended = new Error("Telegram HTTP fixture ended");
     lifetime.abort(ended);
+    await transport.close();
     stopped.reject(ended);
     await Promise.allSettled(pendingDispatches);
     await Promise.allSettled([...pendingRequests, typingSend]);
@@ -340,6 +359,7 @@ export function createTelegramDispatchHttpFixture() {
     clearTelegramRuntimeForTest();
     resetPluginStateStoreForTests();
     vi.unstubAllEnvs();
+    await ipc.close();
     await state.cleanup();
   });
 

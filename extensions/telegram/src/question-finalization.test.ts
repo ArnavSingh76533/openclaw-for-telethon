@@ -1,3 +1,4 @@
+import "./telethon-ipc.test-support.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as TelegramSend from "./send.js";
 
