@@ -36,6 +36,21 @@ class FixtureClient:
 
 
 class CodecTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_channel_departure_uses_receipted_entities(self):
+        from telethon.errors import ChannelPrivateError
+        client = FixtureClient()
+        client.get_entity = AsyncMock(side_effect=ChannelPrivateError(None))
+        update = t.UpdateChannelParticipant(channel_id=123, date=DATE, actor_id=7,
+            user_id=99, qts=1, prev_participant=t.ChannelParticipantSelf(99, 7, DATE),
+            new_participant=t.ChannelParticipantLeft(t.PeerUser(99)))
+        update._entities = client.entities
+        result = await codec.raw_update_to_bot(client, update)
+        self.assertEqual(result["my_chat_member"]["chat"]["id"], -1000000000123)
+        self.assertEqual(result["my_chat_member"]["new_chat_member"]["status"], "left")
+        client.get_entity.assert_not_awaited()
+        with self.assertRaises(ChannelPrivateError):
+            await codec._entity(client, t.PeerChannel(123))
+
     async def test_unavailable_update_does_not_block_following_messages(self):
         client = FixtureClient()
         for kind in (t.UpdateNewMessage, t.UpdateNewChannelMessage,
