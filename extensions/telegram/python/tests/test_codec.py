@@ -36,6 +36,18 @@ class FixtureClient:
 
 
 class CodecTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_channel_reaction_uses_receipted_entities(self):
+        from telethon.errors import ChannelPrivateError
+        client = FixtureClient()
+        client.get_entity = AsyncMock(side_effect=ChannelPrivateError(None))
+        update = t.UpdateBotMessageReaction(t.PeerChannel(123), 10, DATE, t.PeerUser(7),
+                                           [], [t.ReactionEmoji("ok")], 1)
+        update._entities = client.entities
+        result = await codec.raw_update_to_bot(client, update)
+        self.assertEqual(result["message_reaction"]["chat"]["id"], -1000000000123)
+        self.assertEqual(result["message_reaction"]["user"]["id"], 7)
+        client.get_entity.assert_not_awaited()
+
     async def test_private_channel_departure_uses_receipted_entities(self):
         from telethon.errors import ChannelPrivateError
         client = FixtureClient()

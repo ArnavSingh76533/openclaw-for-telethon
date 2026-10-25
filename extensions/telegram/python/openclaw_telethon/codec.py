@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import struct
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +16,8 @@ from telethon import functions, utils
 from telethon.errors import RPCError
 from telethon.extensions import BinaryReader
 from telethon.tl import types as t
+
+_UPDATE_ENTITIES: ContextVar[dict] = ContextVar("telegram_update_entities", default={})
 
 
 class UnsupportedCodec(ValueError):
@@ -233,11 +236,12 @@ async def resolve_input_peer(client: Any, peer: Any) -> Any:
         return t.InputPeerChat(peer_id)
 
 
-async def _entity(client: Any, peer: Any, entities: dict | None = None) -> Any:
+async def _entity(client: Any, peer: Any) -> Any:
     if peer is None:
         return None
     if isinstance(peer, (t.User, t.UserEmpty, t.Chat, t.ChatForbidden, t.Channel, t.ChannelForbidden)):
         return peer
+    entities = _UPDATE_ENTITIES.get()
     if entities and utils.get_peer_id(peer) in entities:
         return entities[utils.get_peer_id(peer)]
     try:
@@ -842,6 +846,15 @@ async def _business_message_to_bot(client: Any, update: Any) -> dict:
 
 
 async def raw_update_to_bot(client: Any, update: Any) -> dict | list[dict] | None:
+    # Keep receipted metadata available after channel access changes, scoped to this update.
+    scope = _UPDATE_ENTITIES.set(getattr(update, "_entities", None) or {})
+    try:
+        return await _raw_update_to_bot(client, update)
+    finally:
+        _UPDATE_ENTITIES.reset(scope)
+
+
+async def _raw_update_to_bot(client: Any, update: Any) -> dict | list[dict] | None:
     if isinstance(update, (t.UpdateShortMessage, t.UpdateShortChatMessage)):
         if update.out:
             return None
@@ -928,12 +941,10 @@ async def raw_update_to_bot(client: Any, update: Any) -> dict | list[dict] | Non
         result["user" if isinstance(voter, (t.User, t.UserEmpty)) else "voter_chat"] = user_to_bot(voter) if isinstance(voter, (t.User, t.UserEmpty)) else chat_to_bot(voter)
         return {"poll_answer": result}
     if isinstance(update, (t.UpdateChannelParticipant, t.UpdateChatParticipant)):
-        # Leaving a private channel removes lookup access; the receipt still owns its metadata.
-        entities = getattr(update, "_entities", {})
         peer = t.PeerChannel(update.channel_id) if isinstance(update, t.UpdateChannelParticipant) else t.PeerChat(update.chat_id)
-        user = user_to_bot(await _entity(client, t.PeerUser(update.user_id), entities))
-        result = {"chat": chat_to_bot(await _entity(client, peer, entities)),
-                  "from": user_to_bot(await _entity(client, t.PeerUser(update.actor_id), entities)),
+        user = user_to_bot(await _entity(client, t.PeerUser(update.user_id)))
+        result = {"chat": chat_to_bot(await _entity(client, peer)),
+                  "from": user_to_bot(await _entity(client, t.PeerUser(update.actor_id))),
                   "date": timestamp(update.date), "old_chat_member": member_to_bot(update.prev_participant, user),
                   "new_chat_member": member_to_bot(update.new_participant, user)}
         me = await client.get_me()
