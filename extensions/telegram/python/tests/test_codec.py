@@ -36,6 +36,17 @@ class FixtureClient:
 
 
 class CodecTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unavailable_update_does_not_block_following_messages(self):
+        client = FixtureClient()
+        for kind in (t.UpdateNewMessage, t.UpdateNewChannelMessage,
+                     t.UpdateEditMessage, t.UpdateEditChannelMessage):
+            update = kind(message=t.MessageEmpty(id=8, peer_id=t.PeerChannel(123)), pts=1, pts_count=1)
+            self.assertIsNone(await codec.raw_update_to_bot(client, update))
+        message = t.Message(id=9, peer_id=t.PeerChannel(123), from_id=t.PeerUser(7),
+                            date=DATE, message="Still deliver this message")
+        result = await codec.raw_update_to_bot(client, t.UpdateNewChannelMessage(message, 2, 1))
+        self.assertEqual(result["message"]["text"], "Still deliver this message")
+
     async def test_cold_bot_session_resolves_configured_numeric_peers(self):
         class ColdClient:
             async def get_input_entity(self, peer):

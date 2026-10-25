@@ -860,6 +860,9 @@ async def raw_update_to_bot(client: Any, update: Any) -> dict | list[dict] | Non
         # Telethon's _dispatch_update, where this initialization normally lives.
         raw_message._finish_init(client, getattr(update, "_entities", {}), None)
     if isinstance(update, (t.UpdateNewMessage, t.UpdateNewChannelMessage, t.UpdateEditMessage, t.UpdateEditChannelMessage)):
+        # Deleted/inaccessible placeholders have no message body to deliver.
+        if isinstance(update.message, t.MessageEmpty):
+            return None
         # Outbound MTProto updates must not create inbound agent turns.
         if getattr(update.message, "out", False):
             return None
