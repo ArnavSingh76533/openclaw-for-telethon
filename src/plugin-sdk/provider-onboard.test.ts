@@ -1,0 +1,78 @@
+import { expect, it } from "vitest";
+import {
+  applyOpencodeZenModelDefault,
+  applyAgentDefaultMediaModel,
+  createAliasOnlyPresetAppliers,
+  OPENCODE_ZEN_DEFAULT_MODEL,
+  resolveAgentModelPrimaryValue,
+  type OpenClawConfig,
+} from "./provider-onboard.js";
+
+function withDefaults(defaults: NonNullable<OpenClawConfig["agents"]>["defaults"]): OpenClawConfig {
+  return { agents: { defaults } };
+}
+
+it("applyAgentDefaultMediaModel preserves selected media defaults and the original config on no-op", () => {
+  const cfg = withDefaults({ mediaModels: { image: { primary: "operator/image" } } });
+  expect(applyAgentDefaultMediaModel(cfg, "image", "provider/image")).toBe(cfg);
+  const next = applyAgentDefaultMediaModel(cfg, "video", "provider/video");
+  expect(next.agents?.defaults?.mediaModels).toEqual({
+    image: { primary: "operator/image" },
+    video: { primary: "provider/video" },
+  });
+  expect(cfg.agents?.defaults?.mediaModels).toEqual({ image: { primary: "operator/image" } });
+});
+const modelRef = "example/default";
+const appliers = createAliasOnlyPresetAppliers({ modelRef, alias: "Example" });
+
+it("adds only the alias entry in provider-only mode", () => {
+  const cfg: OpenClawConfig = {
+    models: { mode: "merge", providers: {} },
+    agents: { defaults: { models: { "other/model": { alias: "Other" } } } },
+  };
+
+  const result = appliers.applyProviderConfig(cfg);
+
+  expect(result.models).toBe(cfg.models);
+  expect(result.agents?.defaults?.model).toBeUndefined();
+  expect(result.agents?.defaults?.models).toEqual({
+    "other/model": { alias: "Other" },
+    [modelRef]: { alias: "Example" },
+  });
+});
+
+it("preserves entry fields and alias while replacing the primary", () => {
+  const cfg = withDefaults({
+    model: { primary: "old/model", fallbacks: ["fallback/model"] },
+    models: { [modelRef]: { alias: "Custom", params: { temperature: 0.2 } } },
+  });
+
+  const result = appliers.applyConfig(cfg);
+
+  expect(resolveAgentModelPrimaryValue(result.agents?.defaults?.model)).toBe(modelRef);
+  expect(result.agents?.defaults?.model).toEqual({
+    primary: modelRef,
+    fallbacks: ["fallback/model"],
+  });
+  expect(result.agents?.defaults?.models?.[modelRef]).toEqual({
+    alias: "Custom",
+    params: { temperature: 0.2 },
+  });
+});
+it("applyOpencodeZenModelDefault no-ops when already the legacy default", () => {
+  const cfg = withDefaults({ model: "opencode-zen/claude-opus-4-5" });
+  const applied = applyOpencodeZenModelDefault(cfg);
+  expect(applied).toEqual({ changed: false, next: cfg });
+});
+
+it("preserves fallbacks when setting primary", () => {
+  const cfg = withDefaults({
+    model: { primary: "anthropic/claude-opus-4-6", fallbacks: ["google/gemini-3-pro"] },
+  });
+  const applied = applyOpencodeZenModelDefault(cfg);
+  expect(applied.changed).toBe(true);
+  expect(applied.next.agents?.defaults?.model).toEqual({
+    primary: OPENCODE_ZEN_DEFAULT_MODEL,
+    fallbacks: ["google/gemini-3.1-pro-preview"],
+  });
+});

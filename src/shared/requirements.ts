@@ -1,0 +1,99 @@
+export type Requirements = {
+  bins: string[];
+  anyBins: string[];
+  env: string[];
+  config: string[];
+  os: string[];
+};
+
+export type RequirementConfigCheck = {
+  path: string;
+  satisfied: boolean;
+};
+
+export type RequirementsMetadata = {
+  requires?: Partial<Pick<Requirements, "bins" | "anyBins" | "env" | "config">>;
+  os?: string[];
+};
+
+export type RequirementRemote = {
+  hasBin?: (bin: string) => boolean;
+  hasAnyBin?: (bins: string[]) => boolean;
+  platforms?: string[];
+};
+
+function normalizeOsRequirementPlatform(platform: string): string {
+  const normalized = platform.trim().toLowerCase();
+  return normalized === "macos" ? "darwin" : normalized;
+}
+
+export function isOsRequirementSatisfied(
+  required: readonly string[],
+  platforms: readonly string[],
+): boolean {
+  if (required.length === 0) {
+    return true;
+  }
+  const normalizedRequired = new Set(required.map(normalizeOsRequirementPlatform));
+  return platforms.some((platform) =>
+    normalizedRequired.has(normalizeOsRequirementPlatform(platform)),
+  );
+}
+
+/** Evaluates entry requirements against the current host and optional remote capabilities. */
+export function evaluateRequirementsFromMetadataWithRemote(params: {
+  always: boolean;
+  hasLocalBin: (bin: string) => boolean;
+  localPlatform: string;
+  isEnvSatisfied: (envName: string) => boolean;
+  isConfigSatisfied: (pathStr: string) => boolean;
+  metadata?: RequirementsMetadata;
+  remote?: RequirementRemote;
+}) {
+  const required: Requirements = {
+    bins: params.metadata?.requires?.bins ?? [],
+    anyBins: params.metadata?.requires?.anyBins ?? [],
+    env: params.metadata?.requires?.env ?? [],
+    config: params.metadata?.requires?.config ?? [],
+    os: params.metadata?.os ?? [],
+  };
+
+  const hasRemoteBin = params.remote?.hasBin;
+  const hasRemoteAnyBin = params.remote?.hasAnyBin;
+  const missingBins = required.bins.filter(
+    (bin) => !params.hasLocalBin(bin) && !hasRemoteBin?.(bin),
+  );
+  const missingAnyBins =
+    required.anyBins.length === 0 ||
+    required.anyBins.some((bin) => params.hasLocalBin(bin)) ||
+    hasRemoteAnyBin?.(required.anyBins)
+      ? []
+      : required.anyBins;
+
+  const missingOs = isOsRequirementSatisfied(required.os, [
+    params.localPlatform,
+    ...(params.remote?.platforms ?? []),
+  ])
+    ? []
+    : required.os;
+
+  const missingEnv = required.env.filter((envName) => !params.isEnvSatisfied(envName));
+  const configChecks = required.config.map((path) => ({
+    path,
+    satisfied: params.isConfigSatisfied(path),
+  }));
+  const missingConfig = configChecks.filter((check) => !check.satisfied).map((check) => check.path);
+
+  // `always` bypasses runtime requirements, but OS remains a hard compatibility boundary.
+  const missing = {
+    bins: params.always ? [] : missingBins,
+    anyBins: params.always ? [] : missingAnyBins,
+    env: params.always ? [] : missingEnv,
+    config: params.always ? [] : missingConfig,
+    os: missingOs,
+  };
+
+  const eligible = Object.values(missing).every((requirements) => requirements.length === 0);
+
+  return { required, missing, eligible, configChecks };
+}

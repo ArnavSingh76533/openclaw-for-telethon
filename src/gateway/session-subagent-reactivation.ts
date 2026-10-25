@@ -1,0 +1,190 @@
+import { readAcpSessionMetaForEntries } from "../acp/runtime/session-meta-readonly.js";
+import { resolveSubagentChildAuthority } from "../agents/subagents/registry/subagent-child-owner-match.js";
+import { isRestartInterruptedSubagent } from "../agents/subagents/registry/subagent-recovery-state.js";
+import { subagentRuns } from "../agents/subagents/registry/subagent-registry-memory.js";
+import {
+  assertSubagentRegistryWriteSourceCurrent,
+  restoreSubagentRunsFromDisk,
+} from "../agents/subagents/registry/subagent-registry-persistence.js";
+import {
+  getLatestLiveSubagentRunByChildSessionKey,
+  getLatestSubagentRunByChildSessionKey,
+} from "../agents/subagents/registry/subagent-registry-read.js";
+import {
+  isSameSubagentRun,
+  isSameSubagentRunOwner,
+} from "../agents/subagents/registry/subagent-run-generation.js";
+import type { InternalSessionEntry, SessionEntry } from "../config/sessions/types.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
+import type { GatewayContextResolver } from "./server-methods/types.js";
+import { SessionRecoverySourceChangedError } from "./session-recovery-source.js";
+
+/** Retain the registry owner that authorizes an interrupted child's operator recovery. */
+export async function prepareRestartInterruptedSubagentRecovery(params: {
+  sessionKey: string;
+  agentId: string;
+  entry: InternalSessionEntry;
+  assertCurrent?: () => void;
+}): Promise<{ runId: string; assertCurrent: () => void } | undefined> {
+  if (params.entry.status !== "interrupted" || params.entry.abortedLastRun !== true) {
+    return undefined;
+  }
+  const observed = await getLatestSubagentRunByChildSessionKey(params.sessionKey, params.agentId);
+  if (
+    !observed ||
+    !isRestartInterruptedSubagent(observed) ||
+    resolveSubagentChildAuthority(observed, params.entry).status !== "verified" ||
+    params.entry.lastRunId !== observed.runId
+  ) {
+    return undefined;
+  }
+  const latest = () =>
+    getLatestLiveSubagentRunByChildSessionKey(params.sessionKey, undefined, params.agentId);
+  if (!latest()) {
+    await restoreSubagentRunsFromDisk({
+      runs: subagentRuns,
+      mergeOnly: true,
+      assertCurrent: params.assertCurrent,
+    });
+  }
+  const interrupted = latest();
+  return {
+    runId: observed.runId,
+    assertCurrent() {
+      params.assertCurrent?.();
+      const current = latest();
+      if (
+        !current ||
+        !isSameSubagentRun(interrupted, observed) ||
+        !isSameSubagentRunOwner(current, interrupted) ||
+        !isRestartInterruptedSubagent(current)
+      ) {
+        throw new SessionRecoverySourceChangedError();
+      }
+    },
+  };
+}
+
+/** Persist the dispatched follow-up prompt so restart recovery cannot reuse the original task. */
+export async function reactivateCompletedSubagentSession(params: {
+  sessionKey: string;
+  runId?: string;
+  task?: string;
+  gatewayContextResolver?: GatewayContextResolver;
+  assertCurrent?: () => void;
+  acpSession?: {
+    cfg: OpenClawConfig;
+    activeSessionAgentId: string;
+    sessionEntry?: SessionEntry;
+  };
+}): Promise<boolean> {
+  const runId = params.runId?.trim();
+  if (!runId) {
+    return false;
+  }
+  const paused = getLatestLiveSubagentRunByChildSessionKey(
+    params.sessionKey,
+    (entry) => entry.pauseReason === "sessions_yield",
+  );
+  const existing = paused ?? (await getLatestSubagentRunByChildSessionKey(params.sessionKey));
+  const continuesInterruptedTask =
+    existing?.execution.status === "interrupted" && isRestartInterruptedSubagent(existing);
+  if (!existing || (!continuesInterruptedTask && typeof existing.execution.endedAt !== "number")) {
+    return false;
+  }
+  if (params.gatewayContextResolver && !params.gatewayContextResolver()) {
+    return false;
+  }
+  if (params.acpSession) {
+    const [acpMeta] = await readAcpSessionMetaForEntries({
+      cfg: params.acpSession.cfg,
+      entries: [
+        {
+          agentId: params.acpSession.activeSessionAgentId,
+          sessionKey: params.sessionKey,
+          entry: params.acpSession.sessionEntry,
+        },
+      ],
+    });
+    params.assertCurrent?.();
+    if (acpMeta) {
+      return false;
+    }
+  }
+  const stateContext = captureOpenClawStateWorkerContext();
+  const liveSource = () =>
+    getLatestLiveSubagentRunByChildSessionKey(
+      params.sessionKey,
+      (entry) => entry.runId === existing.runId,
+    );
+  if (!liveSource()) {
+    await restoreSubagentRunsFromDisk({
+      runs: subagentRuns,
+      mergeOnly: true,
+      context: stateContext,
+      assertCurrent: params.assertCurrent,
+    });
+  }
+  const source = liveSource();
+  if (!source || !isSameSubagentRun(source, existing)) {
+    return false;
+  }
+  const latest = getLatestLiveSubagentRunByChildSessionKey(params.sessionKey);
+  const assertOriginalOwnerCurrent = () => {
+    assertSubagentRegistryWriteSourceCurrent(stateContext);
+    const current = liveSource();
+    const currentLatest = getLatestLiveSubagentRunByChildSessionKey(params.sessionKey);
+    if (
+      !isSameSubagentRunOwner(current, source) ||
+      (latest ? !isSameSubagentRunOwner(currentLatest, latest) : currentLatest !== undefined) ||
+      (current &&
+        (continuesInterruptedTask
+          ? current.execution.status !== "interrupted" || !isRestartInterruptedSubagent(current)
+          : typeof current.execution.endedAt !== "number"))
+    ) {
+      throw new Error("subagent follow-up source changed while its writes settled");
+    }
+    params.assertCurrent?.();
+    if (params.gatewayContextResolver && !params.gatewayContextResolver()) {
+      throw new Error("subagent follow-up Gateway owner retired");
+    }
+  };
+  const runtime = await import("../agents/subagents/registry/subagent-registry.js");
+  assertOriginalOwnerCurrent();
+  const task = params.task;
+  const hasTask = typeof task === "string" && task.trim().length > 0;
+  // A yielded child still owes its parent completion; operator follow-ups must
+  // preserve that wake rather than treating the task as already completed.
+  const gatewayBinding = params.gatewayContextResolver
+    ? { gatewayContextResolver: params.gatewayContextResolver }
+    : {};
+  const replaced =
+    source.pauseReason === "sessions_yield"
+      ? await runtime.adoptPausedSubagentRunForFollowUp({
+          childSessionKey: params.sessionKey,
+          runId,
+          task: hasTask ? task : source.task,
+          assertCurrent: assertOriginalOwnerCurrent,
+          ...gatewayBinding,
+        })
+      : await runtime.replaceSubagentRunAfterSteerCore({
+          previousRunId: source.runId,
+          nextRunId: runId,
+          ...(continuesInterruptedTask
+            ? { expected: source, preserveRequesterSettleWake: true }
+            : { preserveCompletedRun: true }),
+          runTimeoutSeconds: source.runTimeoutSeconds ?? 0,
+          ...(hasTask ? { task } : {}),
+          assertCurrent: assertOriginalOwnerCurrent,
+          ...gatewayBinding,
+        });
+  if (replaced) {
+    return true;
+  }
+  const currentOwner = getLatestLiveSubagentRunByChildSessionKey(params.sessionKey);
+  if (currentOwner?.runId === runId) {
+    return true;
+  }
+  throw new Error("subagent follow-up owner replacement was rejected");
+}

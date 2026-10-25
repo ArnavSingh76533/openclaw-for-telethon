@@ -1,0 +1,37 @@
+export type {
+  AudioTranscriptionConfigContext,
+  AudioTranscriptionRequest,
+  AudioTranscriptionResult,
+  ImageDescriptionRequest,
+  ImageDescriptionResult,
+  ImagesDescriptionInput,
+  ImagesDescriptionRequest,
+  ImagesDescriptionResult,
+  MediaUnderstandingProvider,
+  MediaUnderstandingProviderAuthContext,
+  MediaUnderstandingProviderAuthResult,
+  MediaUnderstandingProviderRequestAuth,
+  MediaUnderstandingProviderSyntheticAuthResult,
+  StructuredExtractionImageInput,
+  StructuredExtractionInput,
+  StructuredExtractionRequest,
+  StructuredExtractionResult,
+  StructuredExtractionTextInput,
+  VideoDescriptionRequest,
+  VideoDescriptionResult,
+} from "../media-understanding/types.js";
+
+export {
+  describeImageWithModel,
+  describeImageWithModelPayloadTransform,
+  describeImagesWithModel,
+  describeImagesWithModelPayloadTransform,
+} from "../media-understanding/image-runtime.js";
+export {
+  buildOpenAiCompatibleVideoRequestBody,
+  coerceOpenAiCompatibleVideoText,
+  describeOpenAiCompatibleVideo,
+  resolveMediaUnderstandingString,
+  type OpenAiCompatibleVideoPayload,
+} from "../media-understanding/openai-compatible-video.ts";
+export { transcribeOpenAiCompatibleAudio } from "../media-understanding/openai-compatible-audio.js";

@@ -1,0 +1,228 @@
+import { expectDefined } from "@openclaw/normalization-core";
+import { Value } from "typebox/value";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ConversationListResultSchema,
+  ConversationSendResultSchema,
+  ConversationTurnResultSchema,
+} from "../../../packages/gateway-protocol/src/schema/agent.js";
+import {
+  DEFAULT_GATEWAY_HTTP_TOOL_DENY,
+  GATEWAY_OWNER_ONLY_CORE_TOOLS,
+} from "../../security/dangerous-tools.js";
+import { compactToolOutputHint } from "../tool-schema-hints.js";
+import { createHostedConversationTools } from "./conversation-tools.js";
+import * as gateway from "./in-process-gateway.js";
+
+const conversation = {
+  conversationRef: "conv_0123456789abcdef0123456789abcdef",
+  channel: "reef",
+  accountId: "default",
+  kind: "direct" as const,
+  target: "reef:peer-agent",
+  firstSeenAt: 100,
+  lastSeenAt: 200,
+};
+const message = { conversationRef: conversation.conversationRef, message: "please acknowledge" };
+const sent = {
+  conversationRef: conversation.conversationRef,
+  channel: "reef",
+  messageId: "reef-outbound-1",
+};
+
+function conversationTool(
+  kind: "list" | "send" | "turn",
+  options: Parameters<typeof createHostedConversationTools>[0] = {},
+) {
+  return expectDefined(
+    createHostedConversationTools(options, "main", {}).find(
+      (tool) => tool.name === `conversations_${kind}`,
+    ),
+    "conversation tool",
+  );
+}
+
+function mockGateway() {
+  return vi.spyOn(gateway, "callAgentToolGatewayRequest").mockImplementation(async ({ method }) => {
+    if (method === "conversations.list") {
+      return { conversations: [conversation] };
+    }
+    if (method === "conversations.send") {
+      return { status: "sent" as const, ...sent, queueId: "queue-1" };
+    }
+    return {
+      status: "replied" as const,
+      ...sent,
+      correlationPersisted: true,
+      reply: {
+        conversationRef: conversation.conversationRef,
+        messageId: "reef-inbound-1",
+        replyToId: "reef-outbound-1",
+        text: "peer acknowledged",
+        timestamp: 300,
+      },
+    };
+  });
+}
+
+describe("conversation tools", () => {
+  afterEach(() => vi.restoreAllMocks());
+  it("declares exact Gateway output contracts and promotes only bounded complete hints", async () => {
+    mockGateway();
+    const list = conversationTool("list");
+    const send = conversationTool("send");
+    const turn = conversationTool("turn");
+    for (const [tool, schema, params] of [
+      [list, ConversationListResultSchema, {}],
+      [send, ConversationSendResultSchema, message],
+      [turn, ConversationTurnResultSchema, message],
+    ] as const) {
+      expect(tool.outputSchema).toBe(schema);
+      const result = await tool.execute(`${tool.name}-contract`, params);
+      expect(Value.Check(schema, result.details)).toBe(true);
+    }
+    expect(compactToolOutputHint(list.outputSchema)).toBe(
+      '{ conversations: Array<{ accountId: string; channel: string; conversationRef: string; firstSeenAt: number; kind: "direct" | "group" | "channel"; lastSeenAt: number; target: string; label?: string; threadId?: string }> }',
+    );
+    expect(compactToolOutputHint(send.outputSchema)).toBe(
+      '{ channel: string; conversationRef: string; status: "sent" | "queued" | "suppressed" | "unknown"; messageId?: string; queueId?: string }',
+    );
+    expect(compactToolOutputHint(turn.outputSchema)).toBe(
+      '{ channel: string; conversationRef: string; correlationPersisted: boolean; messageId: string; reply: { conversationRef: string; messageId: string; text: string; timestamp: number; replyToId?: string; threadId?: string; transcriptArtifactId?: string; transcriptMessageId?: string }; status: "replied" } | { channel: string; conversationRef: string; correlationPersisted: boolean; messageId: string; status: "timeout" } | { channel: string; conversationRef: string; correlationPersisted: boolean; error: string; status: "sent" | "queued" | "suppressed" | "unknown"; messageId?: string }',
+    );
+  });
+
+  it("lists opaque external addresses independently from sessions", async () => {
+    const callGateway = mockGateway();
+    const result = await conversationTool("list").execute("list", {
+      channel: "reef",
+      query: "@peer-agent",
+    });
+    expect(callGateway).toHaveBeenCalledWith({
+      method: "conversations.list",
+      params: { agentId: "main", channel: "reef", query: "@peer-agent", limit: 50 },
+    });
+    expect(result.details).toEqual({ conversations: [conversation] });
+  });
+
+  it("routes sends through the Gateway with a stable operation id", async () => {
+    const callGateway = mockGateway();
+    const tool = conversationTool("send", {
+      sessionId: "operator-session",
+      agentSessionKey: "agent:main:telegram:direct:operator",
+      config: {},
+    });
+    const args = {
+      conversationRef: conversation.conversationRef,
+      message: "hello peer",
+    };
+
+    const firstResult = await tool.execute("tool-call-1", args);
+    const secondResult = await tool.execute("tool-call-1", args);
+    const first = callGateway.mock.calls[0]![0];
+    const second = callGateway.mock.calls[1]![0];
+
+    expect(first).toMatchObject({
+      method: "conversations.send",
+      params: {
+        agentId: "main",
+        sourceSessionKey: "agent:main:telegram:direct:operator",
+        conversationRef: conversation.conversationRef,
+        message: "hello peer",
+      },
+      config: {},
+    });
+    expect(first.params).toMatchObject({
+      operationId: expect.stringMatching(/^convop_[a-f0-9]{32}$/u),
+    });
+    expect(second.params).toEqual(first.params);
+    expect(firstResult.details).toEqual(secondResult.details);
+    expect(firstResult.details).toMatchObject({
+      status: "sent",
+      messageId: "reef-outbound-1",
+      queueId: "queue-1",
+    });
+  });
+
+  it("reports Gateway suppression without claiming delivery", async () => {
+    const callGateway = mockGateway();
+    callGateway.mockResolvedValueOnce({
+      status: "suppressed",
+      conversationRef: conversation.conversationRef,
+      channel: "reef",
+      queueId: "queue-suppressed",
+    });
+
+    const result = await conversationTool("send", { config: {} }).execute("suppressed-call", {
+      conversationRef: conversation.conversationRef,
+      message: "suppressed hello",
+    });
+
+    expect(result.details).toEqual({
+      status: "suppressed",
+      conversationRef: conversation.conversationRef,
+      channel: "reef",
+      queueId: "queue-suppressed",
+    });
+  });
+
+  it("keeps a transient Gateway send failure retryable under the stable tool call id", async () => {
+    const callGateway = mockGateway();
+    callGateway.mockRejectedValueOnce(new Error("gateway unavailable"));
+    const tool = conversationTool("send", { config: {} });
+    const args = {
+      conversationRef: conversation.conversationRef,
+      message: "retry me",
+    };
+
+    await expect(tool.execute("retryable-call", args)).rejects.toThrow("gateway unavailable");
+    await expect(tool.execute("retryable-call", args)).resolves.toMatchObject({
+      details: { status: "sent", messageId: "reef-outbound-1" },
+    });
+    const first = callGateway.mock.calls[0]![0];
+    const second = callGateway.mock.calls[1]![0];
+    expect(second.params).toEqual(first.params);
+  });
+
+  it("uses a stable operation id for correlated turns and cancels on abort", async () => {
+    const callGateway = mockGateway();
+    const tool = conversationTool("turn", {
+      sessionId: "operator-session",
+      agentSessionKey: "agent:main:telegram:direct:operator",
+      config: {},
+    });
+    await tool.execute("turn-call", { ...message, timeoutSeconds: 12 });
+    await tool.execute("turn-call", { ...message, timeoutSeconds: 12 });
+    const first = callGateway.mock.calls[0]![0];
+    const second = callGateway.mock.calls[1]![0];
+    expect(first.params).toMatchObject({ turnId: expect.stringMatching(/^convop_[a-f0-9]{32}$/u) });
+    expect(second.params).toEqual(first.params);
+    const request = vi.fn().mockResolvedValue({ cancelled: true });
+    await first.onSignalAbort?.(request);
+    expect(request).toHaveBeenCalledWith(
+      "conversations.turn.cancel",
+      { agentId: "main", turnId: expect.any(String) },
+      { timeoutMs: 5_000 },
+    );
+    expect(first.params).toMatchObject(request.mock.calls[0]?.[1]);
+  });
+
+  it("validates references and owner access before Gateway delivery", async () => {
+    const callGateway = mockGateway();
+    await expect(
+      conversationTool("send", { config: {} }).execute("send", {
+        conversationRef: "not-a-conversation",
+        message: "hello",
+      }),
+    ).rejects.toThrow("Invalid conversationRef");
+    for (const kind of ["list", "send", "turn"] as const) {
+      const tool = conversationTool(kind, { senderIsOwner: false, config: {} });
+      await expect(tool.execute("blocked", message)).rejects.toThrow("require owner access");
+    }
+    expect(callGateway).not.toHaveBeenCalled();
+    for (const name of ["conversations_list", "conversations_send", "conversations_turn"]) {
+      expect(GATEWAY_OWNER_ONLY_CORE_TOOLS).toContain(name);
+      expect(DEFAULT_GATEWAY_HTTP_TOOL_DENY).toContain(name);
+    }
+  });
+});

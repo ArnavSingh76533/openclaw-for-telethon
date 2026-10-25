@@ -1,0 +1,40 @@
+import type { WorkspaceBootstrapFile } from "./workspace-bootstrap-policy.js";
+
+export type BootstrapTruncationCause = "per-file-limit" | "total-limit";
+export type BootstrapPromptWarningMode = "off" | "once" | "always";
+
+export type BootstrapInjectionStat = {
+  name: string;
+  path: string;
+  origin?: WorkspaceBootstrapFile["origin"];
+  missing: boolean;
+  rawChars: number;
+  injectedChars: number;
+  truncated: boolean;
+};
+
+type BootstrapAnalyzedFile = BootstrapInjectionStat & {
+  effectiveFileLimit: number;
+  nearLimit: boolean;
+  causes: BootstrapTruncationCause[];
+};
+
+export type BootstrapBudgetAnalysis = {
+  truncatedFiles: BootstrapAnalyzedFile[];
+  nearLimitFiles: BootstrapAnalyzedFile[];
+  totalNearLimit: boolean;
+  hasTruncation: boolean;
+  totals: {
+    rawChars: number;
+    injectedChars: number;
+    bootstrapMaxChars: number;
+    bootstrapTotalMaxChars: number;
+  };
+};
+
+export type BootstrapPromptWarning = {
+  signature?: string;
+  warningShown: boolean;
+  lines: string[];
+  warningSignaturesSeen: string[];
+};

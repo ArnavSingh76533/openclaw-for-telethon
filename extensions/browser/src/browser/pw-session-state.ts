@@ -1,0 +1,357 @@
+import { pruneMapToMaxSize } from "openclaw/plugin-sdk/collection-runtime";
+import { resolveExpiresAtMsFromDurationMs } from "openclaw/plugin-sdk/number-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
+import type { ConsoleMessage, Dialog, Frame, Page, Request, Response } from "playwright-core";
+import { saveBrowserDownload } from "./pw-download-capture.js";
+import {
+  MAX_CONSOLE_MESSAGES,
+  MAX_NETWORK_REQUESTS,
+  MAX_PAGE_ERRORS,
+  pageStates,
+  type ArmedDialogResponse,
+  type BrowserObservedDialogRecord,
+  type BrowserObservedState,
+  type BrowserConsoleMessage,
+  type PageState,
+  type RoleRefs,
+  type RoleRefsCacheEntry,
+  BrowserObservedDialogBlockedError,
+} from "./pw-session-contracts.js";
+import {
+  clearArmedDialogResponse,
+  observeDialog,
+  recordClosedDialog,
+  resolveObservedDialogTimeoutMs,
+  resolvePendingDialogForResponse,
+  serializeObservedBrowserState,
+  settleObservedDialog,
+} from "./pw-session-dialogs.js";
+
+// Best-effort cache to make role refs stable even if Playwright returns a different Page object
+// for the same CDP target across requests.
+const roleRefsByTarget = new Map<string, RoleRefsCacheEntry>();
+const MAX_ROLE_REFS_CACHE = 50;
+const MAX_OBSERVED_PAGE_TEXT_CHARS = 2_048;
+
+function truncateObservedPageText(value: string): string {
+  return truncateUtf16Safe(value, MAX_OBSERVED_PAGE_TEXT_CHARS);
+}
+
+export function normalizeCdpUrl(raw: string) {
+  return raw.replace(/\/$/, "");
+}
+
+export function targetKey(cdpUrl: string, targetId: string) {
+  return `${normalizeCdpUrl(cdpUrl)}::${targetId}`;
+}
+
+export function bindRoleRefsTarget(page: Page, cdpUrl: string, targetId?: string | null): void {
+  const normalizedTargetId = normalizeOptionalString(targetId);
+  if (!normalizedTargetId) {
+    return;
+  }
+  const state = ensurePageState(page);
+  const key = targetKey(cdpUrl, normalizedTargetId);
+  if (state.roleRefsInvalidated) {
+    roleRefsByTarget.delete(key);
+  }
+  state.roleRefsInvalidated = false;
+  state.roleRefsTargetKey = key;
+}
+
+export function storeRoleRefsForTarget(opts: {
+  page: Page;
+  cdpUrl: string;
+  targetId?: string;
+  refs: RoleRefs;
+  frameSelector?: string;
+  frame?: Frame;
+  mode: NonNullable<PageState["roleRefsMode"]>;
+}): void {
+  if (opts.frameSelector && !opts.frame) {
+    throw new Error("Frame-scoped role refs require their resolved frame.");
+  }
+  const state = ensurePageState(opts.page);
+  state.roleRefs = opts.refs;
+  state.roleRefsFrame = opts.frame;
+  state.roleRefsMode = opts.mode;
+  const targetId = normalizeOptionalString(opts.targetId);
+  if (!targetId) {
+    state.roleRefsTargetKey = undefined;
+    return;
+  }
+  bindRoleRefsTarget(opts.page, opts.cdpUrl, targetId);
+  const key = targetKey(opts.cdpUrl, targetId);
+  // A selector cannot preserve frame identity across replacement Page objects.
+  // Frame-scoped refs remain local and require a fresh snapshot after reconnect.
+  if (opts.frameSelector) {
+    roleRefsByTarget.delete(key);
+    return;
+  }
+  roleRefsByTarget.set(key, { refs: opts.refs, mode: opts.mode });
+  pruneMapToMaxSize(roleRefsByTarget, MAX_ROLE_REFS_CACHE);
+}
+
+function clearRoleRefs(state: PageState): void {
+  if (state.roleRefsTargetKey) {
+    // A delayed event from an older wrapper may evict newer refs; a snapshot repairs it.
+    roleRefsByTarget.delete(state.roleRefsTargetKey);
+  }
+  state.roleRefs = undefined;
+  state.roleRefsMode = undefined;
+  state.roleRefsFrame = undefined;
+  state.roleRefsTargetKey = undefined;
+}
+
+function currentTargetRoleRefsMode(
+  state: PageState,
+): NonNullable<PageState["roleRefsMode"]> | undefined {
+  if (!state.roleRefsTargetKey) {
+    return undefined;
+  }
+  return roleRefsByTarget.get(state.roleRefsTargetKey)?.mode;
+}
+
+export function restoreRoleRefsForTarget(opts: {
+  cdpUrl: string;
+  targetId?: string;
+  page: Page;
+}): void {
+  const targetId = normalizeOptionalString(opts.targetId) ?? "";
+  if (!targetId) {
+    return;
+  }
+  const cacheKey = targetKey(opts.cdpUrl, targetId);
+  bindRoleRefsTarget(opts.page, opts.cdpUrl, targetId);
+  const cached = roleRefsByTarget.get(cacheKey);
+  if (!cached) {
+    return;
+  }
+  const state = ensurePageState(opts.page);
+  if (state.roleRefs) {
+    return;
+  }
+  state.roleRefs = cached.refs;
+  state.roleRefsMode = cached.mode;
+}
+
+export function ensurePageState(page: Page): PageState {
+  const existing = pageStates.get(page);
+  if (existing) {
+    return existing;
+  }
+
+  const state: PageState = {
+    console: [],
+    errors: [],
+    requests: new Map(),
+    requestIds: new WeakMap(),
+    nextRequestId: 0,
+    armIdUpload: 0,
+    armIdDownload: 0,
+    downloadWaiterDepth: 0,
+    nextObservedDialogId: 0,
+    pendingDialogs: [],
+    recentDialogs: [],
+    dialogAbortControllers: new Set(),
+  };
+  pageStates.set(page, state);
+
+  page.on("console", (msg: ConsoleMessage) => {
+    const location = msg.location();
+    const entry: BrowserConsoleMessage = {
+      type: truncateObservedPageText(msg.type()),
+      text: truncateObservedPageText(msg.text()),
+      timestamp: new Date().toISOString(),
+      location: { ...location, url: truncateObservedPageText(location.url) },
+    };
+    state.console.push(entry);
+    if (state.console.length > MAX_CONSOLE_MESSAGES) {
+      state.console.shift();
+    }
+  });
+  page.on("pageerror", (err: Error) => {
+    state.errors.push({
+      message: truncateObservedPageText(err.message || String(err)),
+      name: err.name ? truncateObservedPageText(err.name) : undefined,
+      stack: err.stack ? truncateObservedPageText(err.stack) : undefined,
+      timestamp: new Date().toISOString(),
+    });
+    if (state.errors.length > MAX_PAGE_ERRORS) {
+      state.errors.shift();
+    }
+  });
+  page.on("request", (req: Request) => {
+    state.nextRequestId += 1;
+    const id = `r${state.nextRequestId}`;
+    state.requestIds.set(req, id);
+    state.requests.set(id, {
+      id,
+      timestamp: new Date().toISOString(),
+      method: req.method(),
+      url: truncateObservedPageText(req.url()),
+      resourceType: req.resourceType(),
+    });
+    pruneMapToMaxSize(state.requests, MAX_NETWORK_REQUESTS);
+  });
+  page.on("response", (resp: Response) => {
+    const id = state.requestIds.get(resp.request());
+    const rec = id ? state.requests.get(id) : undefined;
+    if (!rec) {
+      return;
+    }
+    rec.status = resp.status();
+    rec.ok = resp.ok();
+  });
+  page.on("requestfailed", (req: Request) => {
+    const id = state.requestIds.get(req);
+    const rec = id ? state.requests.get(id) : undefined;
+    if (!rec) {
+      return;
+    }
+    const failureText = req.failure()?.errorText;
+    rec.failureText = failureText ? truncateObservedPageText(failureText) : undefined;
+    rec.ok = false;
+  });
+  page.on("dialog", (dialog: Dialog) => {
+    observeDialog(state, dialog);
+  });
+  page.on("download", (download) => {
+    if (state.downloadWaiterDepth > 0) {
+      return;
+    }
+    const actionCapture = state.actionDownloadCapture;
+    const managedSave = saveBrowserDownload(download, actionCapture);
+    managedSave.catch(() => {});
+    download.path = async () => (await managedSave).path;
+    if (actionCapture) {
+      actionCapture.lastEventAtMs = Date.now();
+    }
+    actionCapture?.pending.push(managedSave);
+    for (const finish of actionCapture?.waiters.splice(0) ?? []) {
+      finish();
+    }
+  });
+  const invalidateFrameRefs = (frame: Frame, navigated: boolean) => {
+    const isMainFrame = frame === page.mainFrame();
+    if (!state.roleRefsTargetKey) {
+      state.roleRefsInvalidated = true;
+    }
+    const pageWideAriaRefs =
+      state.roleRefsMode === "aria" || currentTargetRoleRefsMode(state) === "aria";
+    if ((navigated && isMainFrame) || pageWideAriaRefs || frame === state.roleRefsFrame) {
+      clearRoleRefs(state);
+    }
+  };
+  page.on("framenavigated", (frame) => invalidateFrameRefs(frame, true));
+  page.on("framedetached", (frame) => invalidateFrameRefs(frame, false));
+  page.on("close", () => {
+    const emulationSession = state.emulation?.session;
+    state.emulation = undefined;
+    void emulationSession?.then((session) => session.detach()).catch(() => {});
+    clearArmedDialogResponse(state);
+    for (const controller of state.dialogAbortControllers) {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error("Page closed before browser action completed."));
+      }
+    }
+    state.dialogAbortControllers.clear();
+    state.pendingDialogs = [];
+    pageStates.delete(page);
+  });
+
+  return state;
+}
+
+export function getObservedBrowserStateForPage(page: Page): BrowserObservedState {
+  const state = ensurePageState(page);
+  return serializeObservedBrowserState(state);
+}
+
+export async function respondToObservedDialogOnPage(opts: {
+  page: Page;
+  dialogId?: string;
+  accept: boolean;
+  promptText?: string;
+  closedBy?: "agent" | "armed";
+}): Promise<BrowserObservedDialogRecord> {
+  const state = ensurePageState(opts.page);
+  const pending = resolvePendingDialogForResponse({
+    state,
+    ...(opts.dialogId !== undefined ? { dialogId: opts.dialogId } : {}),
+  });
+  return await settleObservedDialog({
+    state,
+    pending,
+    accept: opts.accept,
+    ...(opts.promptText !== undefined ? { promptText: opts.promptText } : {}),
+    closedBy: opts.closedBy ?? "agent",
+  });
+}
+
+export function markObservedDialogsHandledRemotelyForPage(
+  page: Page,
+  dialogs: readonly BrowserObservedDialogRecord[],
+): BrowserObservedState {
+  const state = ensurePageState(page);
+  // A late action completion owns only the dialogs that interrupted it. A newer
+  // dialog may already be pending while the earlier action's guard settles.
+  const ids = new Set(dialogs.map((dialog) => dialog.id));
+  const pending = state.pendingDialogs.filter((dialog) => ids.has(dialog.id));
+  state.pendingDialogs = state.pendingDialogs.filter((dialog) => !ids.has(dialog.id));
+  for (const dialog of pending) {
+    recordClosedDialog(state, dialog, "remote");
+  }
+  return serializeObservedBrowserState(state);
+}
+
+export function armObservedDialogResponseOnPage(opts: {
+  page: Page;
+  accept: boolean;
+  promptText?: string;
+  timeoutMs?: number;
+}): void {
+  const state = ensurePageState(opts.page);
+  clearArmedDialogResponse(state);
+  const timeoutMs = resolveObservedDialogTimeoutMs(opts.timeoutMs);
+  const expiresAt = resolveExpiresAtMsFromDurationMs(timeoutMs);
+  if (expiresAt === undefined) {
+    return;
+  }
+  const response: ArmedDialogResponse = {
+    accept: opts.accept,
+    expiresAt,
+    ...(opts.promptText !== undefined ? { promptText: opts.promptText } : {}),
+  };
+  response.timer = setTimeout(() => {
+    state.armedDialogResponse = undefined;
+  }, timeoutMs);
+  state.armedDialogResponse = response;
+}
+
+export function createObservedDialogAbortSignalForPage(opts: {
+  page: Page;
+  parentSignal?: AbortSignal;
+}): { signal: AbortSignal; cleanup: () => void } {
+  const state = ensurePageState(opts.page);
+  const controller = new AbortController();
+  const abortForCurrentDialog = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new BrowserObservedDialogBlockedError(serializeObservedBrowserState(state)));
+    }
+  };
+  if (state.pendingDialogs.length > 0) {
+    abortForCurrentDialog();
+  } else {
+    state.dialogAbortControllers.add(controller);
+  }
+  return {
+    signal: opts.parentSignal
+      ? AbortSignal.any([controller.signal, opts.parentSignal])
+      : controller.signal,
+    cleanup: () => {
+      state.dialogAbortControllers.delete(controller);
+    },
+  };
+}

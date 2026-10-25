@@ -1,0 +1,520 @@
+// Gateway net tests cover bind-host selection, loopback/private host detection,
+// trusted proxy IP resolution, container defaults, and interface matching.
+import net from "node:net";
+import os from "node:os";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import * as containerEnvironment from "../infra/container-environment.js";
+import * as interfaces from "../infra/network-interfaces.js";
+import { makeNetworkInterfacesSnapshot } from "../test-helpers/network-interfaces.js";
+import {
+  defaultGatewayBindMode,
+  isLocalishHost,
+  isLoopbackGatewayUrl,
+  isPrivateOrLoopbackAddress,
+  isPrivateOrLoopbackHost,
+  isSecureWebSocketUrl,
+  isTrustedProxyAddress,
+  pickPrimaryLanIPv4,
+  resolveLocalInterfaceAddressMatch,
+  resolveClientIp,
+  resolveGatewayBindHost,
+  resolveGatewayListenHosts,
+  resolveHostName,
+} from "./net.js";
+
+describe("resolveHostName", () => {
+  it.each([
+    ["localhost:18789", "localhost"],
+    ["[::1]:18789", "::1"],
+    ["::1", "::1"],
+  ] as const)("normalizes host form for %s", (input, expected) => {
+    expect(resolveHostName(input), input).toBe(expected);
+  });
+});
+
+describe("isLocalishHost", () => {
+  it("accepts loopback and tailscale serve/funnel host headers", () => {
+    const accepted = [
+      "localhost",
+      "localhost.:18789",
+      "127.0.0.1:18789",
+      "[::1]:18789",
+      "[::ffff:127.0.0.1]:18789",
+      "gateway.tailnet.ts.net",
+    ];
+    for (const host of accepted) {
+      expect(isLocalishHost(host), host).toBe(true);
+    }
+  });
+
+  it("rejects non-local hosts", () => {
+    const rejected = ["example.com", "192.168.1.10", "203.0.113.5:18789"];
+    for (const host of rejected) {
+      expect(isLocalishHost(host), host).toBe(false);
+    }
+  });
+});
+
+describe("isLoopbackGatewayUrl", () => {
+  it.each([
+    ["ws://LOCALHOST:18789", true],
+    ["ws://localhost.:18789", false],
+    ["ws://127.42.0.1:18789", true],
+    ["ws://[::1]:18789", true],
+    ["not-a-url", false],
+  ] as const)("classifies %s as %s", (url, expected) => {
+    expect(isLoopbackGatewayUrl(url)).toBe(expected);
+  });
+});
+
+describe("isTrustedProxyAddress", () => {
+  it.each([
+    ["matches exact IP entries", "192.168.1.1", ["192.168.1.1"], true],
+    ["rejects non-matching exact IP entries", "192.168.1.2", ["192.168.1.1"], false],
+    [
+      "matches one of multiple exact entries",
+      "10.0.0.5",
+      ["192.168.1.1", "10.0.0.5", "172.16.0.1"],
+      true,
+    ],
+    ["ignores surrounding whitespace in exact IP entries", "10.0.0.5", [" 10.0.0.5 "], true],
+    ["matches /24 CIDR entries", "10.42.0.59", ["10.42.0.0/24"], true],
+    ["rejects IPs outside /24 CIDR entries", "10.42.1.1", ["10.42.0.0/24"], false],
+    ["supports IPv6 CIDR notation", "2001:db8::1234", ["2001:db8::/32"], true],
+    [
+      "rejects IPv6 addresses outside the configured CIDR",
+      "2001:db9::1234",
+      ["2001:db8::/32"],
+      false,
+    ],
+    ["normalizes IPv4-mapped IPv6 addresses", "::ffff:192.168.1.1", ["192.168.1.1"], true],
+    ["returns false when IP is undefined", undefined, ["192.168.1.1"], false],
+    ["returns false when trusted proxies are undefined", "192.168.1.1", undefined, false],
+    ["returns false when trusted proxies are empty", "192.168.1.1", [], false],
+    [
+      "rejects invalid CIDR prefixes and addresses",
+      "10.42.0.59",
+      ["10.42.0.0/33", "10.42.0.0/-1", "invalid/24", "2001:db8::/129"],
+      false,
+    ],
+    ["ignores blank trusted proxy entries", "10.0.0.5", [" ", "10.0.0.5", ""], true],
+    ["treats all-blank trusted proxy entries as no match", "10.0.0.5", [" ", "\t"], false],
+  ])("%s", (_name, ip, trustedProxies, expected) => {
+    expect(isTrustedProxyAddress(ip, trustedProxies)).toBe(expected);
+  });
+});
+
+describe("resolveLocalInterfaceAddressMatch", () => {
+  const snapshot = makeNetworkInterfacesSnapshot({
+    lo: [
+      { address: "127.0.0.1", family: "IPv4", internal: true },
+      { address: "::1", family: "IPv6", internal: true },
+    ],
+    eth0: [{ address: "10.42.0.59", family: "IPv4" }],
+    tailscale0: [{ address: "fd7a:115c:a1e0::1234", family: "IPv6" }],
+  });
+
+  it.each([
+    ["10.42.0.59", true],
+    ["::ffff:10.42.0.59", true],
+    ["fd7a:115c:a1e0::1234", true],
+    ["127.0.0.1", true],
+    ["10.42.0.60", false],
+    [undefined, false],
+  ] as const)("classifies %s as %s", (input, expected) => {
+    using _ = vi.spyOn(interfaces, "safeNetworkInterfaces").mockReturnValue(snapshot);
+    expect(resolveLocalInterfaceAddressMatch(input)).toBe(expected);
+  });
+
+  it("reports an indeterminate match when interface discovery is unavailable", () => {
+    using _ = vi.spyOn(interfaces, "safeNetworkInterfaces").mockReturnValue(undefined);
+    expect(resolveLocalInterfaceAddressMatch("10.42.0.59")).toBeUndefined();
+  });
+});
+
+describe("resolveClientIp", () => {
+  it.each([
+    [
+      "returns remote IP when remote is not trusted proxy",
+      "203.0.113.10",
+      "10.0.0.2",
+      ["127.0.0.1"],
+      "203.0.113.10",
+      undefined,
+      undefined,
+    ],
+    [
+      "uses right-most untrusted X-Forwarded-For hop",
+      "127.0.0.1",
+      "198.51.100.99, 10.0.0.9, 127.0.0.1",
+      ["127.0.0.1"],
+      "10.0.0.9",
+      undefined,
+      undefined,
+    ],
+    [
+      "ignores spoofed loopback X-Forwarded-For hops from trusted proxies",
+      "10.0.0.50",
+      "127.0.0.1",
+      ["10.0.0.0/8"],
+      undefined,
+      undefined,
+      undefined,
+    ],
+    [
+      "fails closed when all X-Forwarded-For hops are trusted proxies",
+      "127.0.0.1",
+      "127.0.0.1, ::1",
+      ["127.0.0.1", "::1"],
+      undefined,
+      undefined,
+      undefined,
+    ],
+    [
+      "fails closed when all non-loopback X-Forwarded-For hops are trusted proxies",
+      "10.0.0.50",
+      "10.0.0.2, 10.0.0.1",
+      ["10.0.0.0/8"],
+      undefined,
+      undefined,
+      undefined,
+    ],
+    [
+      "fails closed when trusted proxy omits forwarding headers",
+      "127.0.0.1",
+      undefined,
+      ["127.0.0.1"],
+      undefined,
+      undefined,
+      undefined,
+    ],
+    [
+      "ignores invalid X-Forwarded-For entries",
+      "127.0.0.1",
+      "garbage, 10.0.0.999",
+      ["127.0.0.1"],
+      undefined,
+      undefined,
+      undefined,
+    ],
+    [
+      "does not trust X-Real-IP by default",
+      "127.0.0.1",
+      undefined,
+      ["127.0.0.1"],
+      undefined,
+      "[2001:db8::5]",
+      undefined,
+    ],
+    [
+      "uses X-Real-IP only when explicitly enabled",
+      "127.0.0.1",
+      undefined,
+      ["127.0.0.1"],
+      "2001:db8::5",
+      "[2001:db8::5]",
+      true,
+    ],
+    [
+      "ignores invalid X-Real-IP even when fallback enabled",
+      "127.0.0.1",
+      undefined,
+      ["127.0.0.1"],
+      undefined,
+      "not-an-ip",
+      true,
+    ],
+  ])(
+    "%s",
+    (_name, remoteAddr, forwardedFor, trustedProxies, expected, realIp, allowRealIpFallback) => {
+      const ip = resolveClientIp({
+        remoteAddr,
+        forwardedFor,
+        realIp,
+        trustedProxies,
+        allowRealIpFallback,
+      });
+      expect(ip).toBe(expected);
+    },
+  );
+});
+
+describe("resolveGatewayListenHosts", () => {
+  function mockBind(available: boolean) {
+    const server = new net.Server();
+    const listen = vi.spyOn(server, "listen").mockImplementation(() => {
+      queueMicrotask(() =>
+        server.emit(available ? "listening" : "error", new Error("bind failed")),
+      );
+      return server;
+    });
+    vi.spyOn(net, "createServer").mockReturnValue(server);
+    return listen;
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["non-loopback host passthrough", "0.0.0.0", ["0.0.0.0"]],
+    ["IPv6 host passthrough", "::1", ["::1"]],
+    [
+      "specific non-loopback host with loopback alias available",
+      "100.64.0.1",
+      ["100.64.0.1", "127.0.0.1"],
+    ],
+    ["loopback with IPv6 unavailable", "127.0.0.1", ["127.0.0.1"]],
+  ] as const)("resolves listen hosts: %s", async (_name, host, expected) => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    const listen = mockBind(false);
+    const hosts = await resolveGatewayListenHosts(host);
+    expect(hosts).toEqual(expected);
+    expect(listen).toHaveBeenCalledTimes(host === "127.0.0.1" ? 1 : 0);
+  });
+
+  it("skips ::1 on Windows even when IPv6 is bindable", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const listen = mockBind(true);
+    const hosts = await resolveGatewayListenHosts("127.0.0.1");
+    expect(hosts).toEqual(["127.0.0.1"]);
+    expect(listen).not.toHaveBeenCalled();
+  });
+
+  it("still includes ::1 on non-Windows when IPv6 is bindable", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const listen = mockBind(true);
+    const hosts = await resolveGatewayListenHosts("127.0.0.1");
+    expect(hosts).toEqual(["127.0.0.1", "::1"]);
+    expect(listen).toHaveBeenCalledWith(0, "::1");
+  });
+});
+
+describe("gateway bind probe lifecycle", () => {
+  let server: net.Server;
+  let listenSpy: MockInstance<net.Server["listen"]>;
+  let closeSpy: MockInstance<net.Server["close"]>;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    server = new net.Server();
+    listenSpy = vi.spyOn(server, "listen").mockReturnValue(server);
+    closeSpy = vi.spyOn(server, "close");
+    vi.spyOn(net, "createServer").mockReturnValue(server);
+  });
+
+  afterEach(() => {
+    server.close();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("bounds a never-emitting probe and closes a listener arriving after timeout", async () => {
+    const results: string[][] = [];
+    const pending = resolveGatewayListenHosts("127.0.0.1").then((hosts) => results.push(hosts));
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(results).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(results).toEqual([["127.0.0.1"]]);
+    expect(closeSpy).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Model a late native bind with a real ephemeral socket, not just a mock event.
+    listenSpy.mockRestore();
+    const closed = new Promise<void>((resolve) => {
+      server.once("close", resolve);
+    });
+    server.listen(0, "127.0.0.1");
+    await closed;
+    await pending;
+    expect(server.listening).toBe(false);
+    expect(results).toEqual([["127.0.0.1"]]);
+    expect(closeSpy).toHaveBeenCalledTimes(2);
+    server.emit("error", new Error("late bind error"));
+    expect(results).toEqual([["127.0.0.1"]]);
+  });
+
+  it.each(["error", "listening"] as const)(
+    "settles once on %s and cancels the deadline",
+    async (event) => {
+      const result = resolveGatewayListenHosts("127.0.0.1");
+      server.emit(event, new Error("bind failed"));
+      const expected = event === "listening" ? ["127.0.0.1", "::1"] : ["127.0.0.1"];
+      expect(await result).toEqual(expected);
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(closeSpy).toHaveBeenCalledOnce();
+      // The other terminal event must not change the already published decision.
+      server.emit(event === "error" ? "listening" : "error", new Error("late event"));
+      expect(await result).toEqual(expected);
+    },
+  );
+
+  it("treats a synchronous listen failure as an unavailable probe", async () => {
+    listenSpy.mockImplementation(() => {
+      throw new Error("listen failed synchronously");
+    });
+    await expect(resolveGatewayListenHosts("127.0.0.1")).resolves.toEqual(["127.0.0.1"]);
+    expect(closeSpy).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("pickPrimaryLanIPv4", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("selects the preferred LAN interface", () => {
+    vi.spyOn(os, "networkInterfaces").mockReturnValue(
+      makeNetworkInterfacesSnapshot({
+        lo0: [{ address: "127.0.0.1", family: "IPv4", internal: true }],
+        en0: [{ address: "192.168.1.42", family: "IPv4" }],
+      }),
+    );
+    expect(pickPrimaryLanIPv4()).toBe("192.168.1.42");
+  });
+});
+
+describe("isPrivateOrLoopbackAddress", () => {
+  it("rejects public IP addresses", () => {
+    const rejected = [
+      "1.1.1.1",
+      "8.8.8.8",
+      "172.32.0.1",
+      "203.0.113.10",
+      "2001:4860:4860::8888",
+      "64:ff9b:1::8.8.8.8",
+    ];
+    for (const ip of rejected) {
+      expect(isPrivateOrLoopbackAddress(ip)).toBe(false);
+    }
+  });
+});
+
+describe("isPrivateOrLoopbackHost", () => {
+  it("rejects empty/falsy input", () => {
+    expect(isPrivateOrLoopbackHost("")).toBe(false);
+  });
+});
+
+describe("resolveGatewayBindHost", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("closes a successful real loopback probe for a custom bind", async () => {
+    const probe = new net.Server();
+    vi.spyOn(net, "createServer").mockReturnValue(probe);
+    expect(await resolveGatewayBindHost("custom", "127.0.0.1")).toBe("127.0.0.1");
+    expect(probe.listening).toBe(false);
+    expect(probe.address()).toBeNull();
+  });
+
+  it("returns 127.0.0.1 for auto mode on non-container host", async () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(false);
+    expect(await resolveGatewayBindHost("auto")).toBe("127.0.0.1");
+  });
+
+  it("returns 0.0.0.0 for auto mode inside a container", async () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(true);
+    expect(await resolveGatewayBindHost("auto")).toBe("0.0.0.0");
+  });
+
+  it("defaults to loopback when bind is undefined (non-container)", async () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(false);
+    const createServerSpy = vi.spyOn(net, "createServer");
+    expect(await resolveGatewayBindHost(undefined)).toBe("127.0.0.1");
+    expect(createServerSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("defaultGatewayBindMode", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns loopback on non-container host", () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(false);
+    expect(defaultGatewayBindMode()).toBe("loopback");
+  });
+
+  it("returns auto inside a container", () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(true);
+    expect(defaultGatewayBindMode()).toBe("auto");
+  });
+
+  it("returns loopback inside a container when tailscale serve is active", () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(true);
+    expect(defaultGatewayBindMode("serve")).toBe("loopback");
+  });
+
+  it("returns auto inside a container when tailscale is off", () => {
+    vi.spyOn(containerEnvironment, "isContainerEnvironment").mockReturnValue(true);
+    expect(defaultGatewayBindMode("off")).toBe("auto");
+  });
+});
+
+describe("isSecureWebSocketUrl", () => {
+  it.each([
+    // wss:// always accepted
+    ["wss://remote.example.com:18789", true],
+    // ws:// loopback accepted
+    ["ws://127.0.0.1:18789", true],
+    ["ws://localhost:18789", true],
+    ["ws://[::1]:18789", true],
+    // ws:// trusted LAN/Tailnet endpoints accepted
+    ["ws://10.0.0.5:18789", true],
+    ["ws://172.16.0.1:18789", true],
+    ["ws://192.168.1.100:18789", true],
+    ["ws://169.254.10.20:18789", true],
+    ["ws://100.64.0.1:18789", true],
+    ["ws://[fd12:3456:789a::1]:18789", true],
+    ["ws://[fe80::1]:18789", true],
+    ["ws://gateway.local:18789", true],
+    ["ws://machine.tail123.ts.net:18789", true],
+    ["ws://[::]:18789", false],
+    ["ws://[ff02::1]:18789", false],
+    // ws:// public addresses rejected
+    ["ws://remote.example.com:18789", false],
+    ["ws://1.1.1.1:18789", false],
+    // invalid URLs
+    ["not-a-url", false],
+    ["http://127.0.0.1:18789", true],
+    ["https://remote.example.com:18789", true],
+    ["http://remote.example.com:18789", false],
+  ] as const)("defaults secure websocket behavior for %s", (input, expected) => {
+    expect(isSecureWebSocketUrl(input), input).toBe(expected);
+  });
+
+  it("allows arbitrary private-dns ws:// hostnames only when opt-in is enabled", () => {
+    const allowedWhenOptedIn = ["ws://gateway.private.example:18789"];
+
+    for (const input of allowedWhenOptedIn) {
+      expect(isSecureWebSocketUrl(input), input).toBe(false);
+      expect(isSecureWebSocketUrl(input, { allowPrivateWs: true }), input).toBe(true);
+    }
+  });
+
+  it("still rejects ws:// public IP literals when opt-in is enabled", () => {
+    const publicIpWsUrls = ["ws://1.1.1.1:18789", "ws://8.8.8.8:18789", "ws://203.0.113.10:18789"];
+
+    for (const input of publicIpWsUrls) {
+      expect(isSecureWebSocketUrl(input, { allowPrivateWs: true }), input).toBe(false);
+    }
+  });
+
+  it("still rejects non-unicast IPv6 ws:// even when opt-in is enabled", () => {
+    const disallowedWhenOptedIn = [
+      "ws://[::]:18789",
+      "ws://[0:0::0]:18789",
+      "ws://[ff02::1]:18789",
+    ];
+
+    for (const input of disallowedWhenOptedIn) {
+      expect(isSecureWebSocketUrl(input, { allowPrivateWs: true }), input).toBe(false);
+    }
+  });
+});

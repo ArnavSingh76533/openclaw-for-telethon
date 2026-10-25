@@ -1,0 +1,85 @@
+import { describe, expect, it } from "vitest";
+import type { MsgContext } from "../auto-reply/templating.js";
+import { selectAttachments } from "./attachments.js";
+import { normalizeAttachments } from "./attachments.normalize.js";
+import type { MediaAttachment } from "./types.js";
+
+describe("media-understanding selectAttachments guards", () => {
+  it("returns no selections when incoming media is not an array", () => {
+    const context = { media: { malformed: true } } as unknown as MsgContext;
+    expect(
+      selectAttachments({
+        capability: "audio",
+        attachments: normalizeAttachments(context),
+        policy: { prefer: "url" },
+      }),
+    ).toStrictEqual({ selected: [], droppedAttachmentIndexes: [] });
+  });
+
+  it("returns no selections for malformed incoming media entries", () => {
+    const context = {
+      media: [null, { path: 123 }, { url: true }, { contentType: { nope: true } }],
+    } as unknown as MsgContext;
+    expect(
+      selectAttachments({
+        capability: "audio",
+        attachments: normalizeAttachments(context),
+        policy: { prefer: "path" },
+      }),
+    ).toStrictEqual({ selected: [], droppedAttachmentIndexes: [] });
+  });
+
+  it("reports only same-capability attachments dropped by truncation", () => {
+    expect(
+      selectAttachments({
+        capability: "image",
+        attachments: [
+          { index: 0, path: "/tmp/first.jpg", mime: "image/jpeg" },
+          { index: 1, path: "/tmp/note.ogg", mime: "audio/ogg" },
+          { index: 2, path: "/tmp/second.jpg", mime: "image/jpeg" },
+          { index: 3, path: "/tmp/third.jpg", mime: "image/jpeg" },
+        ],
+      }),
+    ).toStrictEqual({
+      selected: [{ index: 0, path: "/tmp/first.jpg", mime: "image/jpeg" }],
+      droppedAttachmentIndexes: [2, 3],
+    });
+  });
+
+  it.each([
+    { prefer: "last", limit: 2, selected: [4, 3], dropped: [14, 11] },
+    { prefer: "url", limit: 2, selected: [0, 3], dropped: [23, 14] },
+  ] as const)(
+    "preserves references and order with $prefer preference and limit $limit",
+    ({ prefer, limit, selected, dropped }) => {
+      const attachments: MediaAttachment[] = [
+        { index: 11, kind: "image", url: "https://example.test/first.png" },
+        { index: 12, kind: "audio", path: "/tmp/note.ogg" },
+        { index: 14, kind: "image", path: "/tmp/second.png" },
+        {
+          index: 18,
+          kind: "image",
+          path: "/tmp/third.png",
+          url: "https://example.test/third.png",
+        },
+        { index: 23, kind: "image", url: "https://example.test/fourth.png" },
+      ];
+      for (const attachment of attachments) {
+        Object.freeze(attachment);
+      }
+      Object.freeze(attachments);
+
+      const result = selectAttachments({
+        capability: "image",
+        attachments,
+        policy: { mode: "all", prefer, maxAttachments: limit },
+      });
+
+      expect(result.selected).toHaveLength(selected.length);
+      for (const [position, inputPosition] of selected.entries()) {
+        expect(result.selected[position]).toBe(attachments[inputPosition]);
+      }
+      expect(result.droppedAttachmentIndexes).toEqual(dropped);
+    },
+  );
+});

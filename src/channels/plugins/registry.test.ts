@@ -1,0 +1,151 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
+import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
+import { normalizeAnyChannelId } from "../registry-normalize.js";
+import {
+  getChannelPlugin,
+  getLoadedChannelPlugin,
+  listChannelPlugins,
+  resolveChannelPluginRegistration,
+} from "./registry.js";
+
+vi.mock("./bundled.js", () => ({
+  getBundledChannelPlugin: (id: string) =>
+    id === "fallback"
+      ? {
+          id: "fallback",
+          meta: { label: "fallback" },
+        }
+      : undefined,
+}));
+
+afterEach(() => {
+  resetPluginRuntimeStateForTest();
+});
+
+function channelEntry(id: string, label = id) {
+  return { pluginId: id, plugin: createChannelTestPluginBase({ id, label }), source: "test" };
+}
+
+describe("listChannelPlugins", () => {
+  it("keeps the scoped channel implementation and its registration provenance together", () => {
+    const root = createChannelTestPluginBase({ id: "fallback", label: "Root" });
+    const scoped = createChannelTestPluginBase({ id: "fallback", label: "Scoped" });
+    const resolveChannelRuntime = vi.fn();
+    setActivePluginRegistry(
+      createTestRegistry([{ pluginId: "root", plugin: root, origin: "bundled", source: "root" }]),
+    );
+    const registry = createEmptyPluginRegistry();
+    registry.channels = [
+      {
+        pluginId: "scoped",
+        plugin: scoped,
+        origin: "config",
+        source: "scoped",
+        resolveChannelRuntime,
+      },
+    ];
+
+    withPluginRuntimeRegistryScope(registry, () => {
+      expect(resolveChannelPluginRegistration("fallback")).toEqual({
+        plugin: scoped,
+        origin: "config",
+        resolveChannelRuntime,
+      });
+      expect(getChannelPlugin("fallback")).toBe(scoped);
+    });
+    expect(getChannelPlugin("fallback")).toBe(root);
+  });
+
+  it("preserves unrelated root and bundled addressability inside an empty CLI handle", () => {
+    const root = createChannelTestPluginBase({ id: "root-only" });
+    setActivePluginRegistry(
+      createTestRegistry([{ pluginId: "root-only", plugin: root, source: "root" }]),
+    );
+
+    withPluginRuntimeRegistryScope(createEmptyPluginRegistry(), () => {
+      expect(getChannelPlugin("root-only")).toBe(root);
+      expect(resolveChannelPluginRegistration("fallback")?.origin).toBe("bundled");
+    });
+  });
+
+  it("keeps the first channel implementation and provenance when channel ids collide", () => {
+    const registry = createEmptyPluginRegistry();
+    const firstPlugin = createChannelTestPluginBase({ id: "duplicate", label: "first" });
+    const secondPlugin = createChannelTestPluginBase({ id: "duplicate", label: "second" });
+    registry.channels = [
+      {
+        pluginId: "first-channel-plugin",
+        plugin: firstPlugin,
+        origin: "config",
+        source: "first",
+      },
+      {
+        pluginId: "second-channel-plugin",
+        plugin: secondPlugin,
+        origin: "bundled",
+        source: "second",
+      },
+    ];
+    setActivePluginRegistry(registry);
+
+    expect(listChannelPlugins()).toEqual([firstPlugin]);
+    expect(getLoadedChannelPlugin("duplicate")).toBe(firstPlugin);
+    expect(normalizeAnyChannelId("DUPLICATE")).toBe("duplicate");
+    expect(getLoadedChannelPlugin("DUPLICATE")).toBeUndefined();
+    expect(getChannelPlugin("duplicate")).toBe(firstPlugin);
+    expect(resolveChannelPluginRegistration("duplicate")).toEqual({
+      plugin: firstPlugin,
+      origin: "config",
+    });
+  });
+
+  it("rebuilds channel lookups when the active registry object changes without a version bump", () => {
+    const first = createEmptyPluginRegistry();
+    first.channels = [channelEntry("alpha")];
+    setActivePluginRegistry(first);
+
+    expect(getChannelPlugin("alpha")?.meta.label).toBe("alpha");
+    expect(getChannelPlugin("beta")).toBeUndefined();
+
+    const second = createEmptyPluginRegistry();
+    second.channels = [channelEntry("beta")];
+    setActivePluginRegistry(second);
+
+    expect(getChannelPlugin("alpha")).toBeUndefined();
+    expect(getChannelPlugin("beta")?.meta.label).toBe("beta");
+    expect(listChannelPlugins().map((plugin) => plugin.id)).toEqual(["beta"]);
+  });
+
+  it("builds the loaded channel view once per registry version", () => {
+    const registry = createEmptyPluginRegistry();
+    let buildCount = 0;
+    registry.channels = new Proxy([channelEntry("zeta"), channelEntry("alpha")], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) {
+          buildCount += 1;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    setActivePluginRegistry(registry);
+
+    expect(normalizeAnyChannelId("alpha")).toBe("alpha");
+    expect(getChannelPlugin("alpha")?.meta.label).toBe("alpha");
+    expect(resolveChannelPluginRegistration("zeta")?.plugin.meta.label).toBe("zeta");
+    expect(listChannelPlugins().map((plugin) => plugin.id)).toEqual(["alpha", "zeta"]);
+    expect(buildCount).toBe(1);
+
+    setActivePluginRegistry(registry);
+
+    expect(normalizeAnyChannelId("zeta")).toBe("zeta");
+    expect(getChannelPlugin("alpha")?.meta.label).toBe("alpha");
+    expect(listChannelPlugins().map((plugin) => plugin.id)).toEqual(["alpha", "zeta"]);
+    expect(buildCount).toBe(2);
+  });
+});

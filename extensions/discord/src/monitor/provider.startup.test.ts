@@ -1,0 +1,167 @@
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { createTestPluginServiceScheduler } from "openclaw/plugin-sdk/plugin-test-api";
+import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
+import { beforeEach, expect, it, vi } from "vitest";
+import { Client } from "../internal/client.js";
+
+const { registerVoiceClientSpy, waitForRegistration, stopPresenceListener, gateway, supervisor } =
+  vi.hoisted(() => ({
+    registerVoiceClientSpy: vi.fn(),
+    stopPresenceListener: vi.fn(async () => {}),
+    waitForRegistration: vi.fn(),
+    gateway: { id: "gateway", registerClient: vi.fn() },
+    supervisor: { shutdown: vi.fn(), handleError: vi.fn() },
+  }));
+vi.mock("../internal/voice.js", () => ({
+  VoicePlugin: class VoicePlugin {
+    id = "voice";
+    registerClient(client: Pick<Client, "getPlugin">) {
+      registerVoiceClientSpy(client);
+      if (!client.getPlugin("gateway")) {
+        throw new Error("gateway plugin missing");
+      }
+    }
+  },
+}));
+// mock-isolation: startup tests control presence without starting live timers.
+vi.mock("./auto-presence.js", () => ({
+  createDiscordAutoPresenceController: vi.fn(() => ({
+    enabled: false,
+    start: vi.fn(),
+    stop: vi.fn(),
+    refresh: vi.fn(),
+  })),
+}));
+// mock-isolation: startup tests own the synthetic gateway registration barrier.
+vi.mock("./gateway-plugin.js", () => ({
+  createDiscordGatewayPlugin: vi.fn(() => gateway),
+  waitForDiscordGatewayPluginRegistration: waitForRegistration,
+}));
+// mock-isolation: observe startup cleanup without starting a live supervisor.
+vi.mock("./gateway-supervisor.js", () => ({
+  createDiscordGatewaySupervisor: vi.fn(() => supervisor),
+}));
+vi.mock("./listeners.js", () => {
+  const listener = (type: string) =>
+    function () {
+      return { type };
+    };
+  return {
+    DiscordMessageListener: listener("message"),
+    DiscordInteractionListener: listener("interaction"),
+    DiscordPresenceListener: function DiscordPresenceListener() {
+      return { type: "presence", stop: stopPresenceListener };
+    },
+    DiscordPresenceGuildCreateListener: listener("presence-guild-create"),
+    DiscordPresenceGuildDeleteListener: listener("presence-guild-delete"),
+    DiscordPresenceReadyListener: listener("presence-ready"),
+    DiscordReactionListener: listener("reaction-add"),
+    DiscordReactionRemoveListener: listener("reaction-remove"),
+    DiscordThreadDeleteListener: listener("thread-delete"),
+    DiscordThreadReadyListener: listener("thread-ready"),
+    DiscordThreadUpdateListener: listener("thread-update"),
+    registerDiscordListener: vi.fn(),
+  };
+});
+
+import { createRuntimeSpies } from "../../../test-support/runtime-spies.js";
+import { DISCORD_REST_TIMEOUT_MS } from "../internal/rest.js";
+import { createDiscordGatewaySupervisor } from "./gateway-supervisor.js";
+import { registerDiscordListener } from "./listeners.js";
+import {
+  createDiscordMonitorClient,
+  fetchDiscordBotIdentity,
+  registerDiscordMonitorListeners,
+} from "./provider.startup.js";
+
+beforeEach(() => vi.clearAllMocks());
+
+function createMonitorClient(
+  overrides: Partial<Parameters<typeof createDiscordMonitorClient>[0]> = {},
+) {
+  return createDiscordMonitorClient({
+    scheduler: createTestPluginServiceScheduler(),
+    accountId: "default",
+    applicationId: "app-1",
+    token: "token-1",
+    commands: [],
+    components: [],
+    modals: [],
+    voiceEnabled: false,
+    discordConfig: {},
+    runtime: createRuntimeSpies(),
+    isDisallowedIntentsError: () => false,
+    ...overrides,
+  });
+}
+
+it("registers voice after gateway setup and awaits registration before supervision", async () => {
+  const registration = createDeferred<void>();
+  waitForRegistration.mockReturnValueOnce(registration.promise);
+  const pending = createMonitorClient({ voiceEnabled: true });
+  await Promise.resolve();
+  expect(waitForRegistration).toHaveBeenCalledWith(gateway);
+  expect(createDiscordGatewaySupervisor).not.toHaveBeenCalled();
+  registration.resolve();
+  const result = await pending;
+  expect(registerVoiceClientSpy).toHaveBeenCalledExactlyOnceWith(result.client);
+  expect(createDiscordGatewaySupervisor).toHaveBeenCalledOnce();
+  expect(result.gatewaySupervisor).toBe(supervisor);
+});
+
+it("passes REST timeout options and fetch to internal Discord REST", async () => {
+  const restFetch = vi.fn<typeof fetch>();
+  const { client } = await createMonitorClient({ restFetch });
+  expect(client.options.requestOptions).toEqual({
+    timeout: DISCORD_REST_TIMEOUT_MS,
+    fetch: restFetch,
+  });
+});
+
+it("registers and stops presence lifecycle listeners with reactions initially disabled", async () => {
+  const stop = registerDiscordMonitorListeners({
+    cfg: {},
+    client: { listeners: [] },
+    accountId: "default",
+    discordConfig: { intents: { presence: true } },
+    runtime: createRuntimeSpies(),
+    botUserId: "bot-1",
+    dmEnabled: false,
+    groupDmEnabled: false,
+    dmPolicy: "disabled",
+    groupPolicy: "allowlist",
+    guildEntries: { "guild-1": { id: "guild-1", reactionNotifications: "off" } },
+    logger: createSubsystemLogger("discord-test"),
+    messageHandler: vi.fn(async () => {}),
+  });
+  expect(
+    vi
+      .mocked(registerDiscordListener)
+      .mock.calls.map(([, listener]) => (listener as { type?: string }).type),
+  ).toEqual([
+    "interaction",
+    "message",
+    "GUILD_CREATE",
+    ...["add", "remove"].map((event) => `reaction-${event}`),
+    ...["update", "ready", "delete"].map((event) => `thread-${event}`),
+    "presence",
+    ...["guild-create", "guild-delete", "ready"].map((event) => `presence-${event}`),
+  ]);
+  await stop();
+  expect(stopPresenceListener).toHaveBeenCalledOnce();
+});
+
+it("derives the bot id from a token without calling /users/@me", async () => {
+  const fetchUser = vi.fn(async () => {
+    throw new Error("network should not be used");
+  });
+  const botId = "1477179610322964541";
+  await expect(
+    fetchDiscordBotIdentity({
+      client: { fetchUser },
+      token: `${Buffer.from(botId).toString("base64")}.GhIiP9.vU1xEpJ6NjFm`,
+      runtime: createRuntimeSpies(),
+    }),
+  ).resolves.toEqual({ botUserId: botId, botUserName: undefined });
+  expect(fetchUser).not.toHaveBeenCalled();
+});

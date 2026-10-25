@@ -1,0 +1,29 @@
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { CodeSafetySummaryCache } from "./audit.deep.runtime.js";
+import type { SecurityAuditFinding } from "./audit.types.js";
+
+export async function collectDeepCodeSafetyFindings(params: {
+  cfg: OpenClawConfig;
+  stateDir: string;
+  deep: boolean;
+  workspaceDir?: string;
+  summaryCache?: CodeSafetySummaryCache;
+}): Promise<SecurityAuditFinding[]> {
+  if (!params.deep) {
+    return [];
+  }
+
+  const auditDeep = await import("./audit.deep.runtime.js");
+  return [
+    ...(await auditDeep.collectPluginsCodeSafetyFindings({
+      stateDir: params.stateDir,
+      summaryCache: params.summaryCache,
+    })),
+    ...(await auditDeep.collectInstalledSkillsCodeSafetyFindings({
+      cfg: params.cfg,
+      stateDir: params.stateDir,
+      workspaceDir: params.workspaceDir,
+      summaryCache: params.summaryCache,
+    })),
+  ];
+}

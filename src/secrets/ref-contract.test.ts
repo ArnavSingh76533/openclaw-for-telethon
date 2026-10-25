@@ -1,0 +1,54 @@
+/** Tests secret ref id validation, labels, and provider alias contracts. */
+import { describe, expect, it } from "vitest";
+import {
+  INVALID_FILE_SECRET_REF_IDS,
+  INVALID_EXEC_SECRET_REF_IDS,
+  VALID_FILE_SECRET_REF_IDS,
+  VALID_EXEC_SECRET_REF_IDS,
+} from "../test-utils/secret-ref-test-vectors.js";
+import {
+  isValidExecSecretRefId,
+  isValidFileSecretRefId,
+  isValidSecretRef,
+  resolveDefaultSecretProviderAlias,
+} from "./ref-contract.js";
+
+describe("file secret ref id validation", () => {
+  it("accepts valid file secret ref ids", () => {
+    for (const id of VALID_FILE_SECRET_REF_IDS) {
+      expect(isValidFileSecretRefId(id), `expected valid id: ${id}`).toBe(true);
+    }
+  });
+
+  it("rejects invalid file secret ref ids", () => {
+    for (const id of INVALID_FILE_SECRET_REF_IDS) {
+      expect(isValidFileSecretRefId(id), `expected invalid id: ${id}`).toBe(false);
+    }
+  });
+});
+
+describe("exec secret ref id validation", () => {
+  it("accepts valid exec secret ref ids", () => {
+    for (const id of VALID_EXEC_SECRET_REF_IDS) {
+      expect(isValidExecSecretRefId(id), `expected valid id: ${id}`).toBe(true);
+    }
+  });
+
+  it("rejects invalid exec secret ref ids", () => {
+    for (const id of INVALID_EXEC_SECRET_REF_IDS) {
+      expect(isValidExecSecretRefId(id), `expected invalid id: ${id}`).toBe(false);
+    }
+  });
+});
+
+describe("secret ref validation", () => {
+  it("uses env-name grammar and source-specific defaults for store refs", () => {
+    expect(isValidSecretRef({ source: "store", provider: "default", id: "STORED_API_KEY" })).toBe(
+      true,
+    );
+    expect(isValidSecretRef({ source: "store", provider: "default", id: "lowercase" })).toBe(false);
+    expect(
+      resolveDefaultSecretProviderAlias({ secrets: { defaults: { store: "teamstore" } } }, "store"),
+    ).toBe("teamstore");
+  });
+});

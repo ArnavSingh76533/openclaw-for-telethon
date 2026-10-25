@@ -1,0 +1,799 @@
+import { EventEmitter } from "node:events";
+// Discord tests cover provider plugin behavior.
+import { IncognitoSessionSyncAccessError } from "openclaw/plugin-sdk/acp-runtime";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { createTestPluginServiceScheduler } from "openclaw/plugin-sdk/plugin-test-api";
+import {
+  createEmptyPluginRegistry,
+  setActivePluginRegistry,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { RateLimitError, RequestClient } from "../internal/rest.js";
+import {
+  baseConfig,
+  baseRuntime,
+  getProviderMonitorTestMocks,
+  resetDiscordProviderMonitorMocks,
+} from "../test-support/provider.test-support.js";
+import * as voiceCommands from "../voice/command.js";
+import { DiscordGuildJoinIntroductionListener } from "./listeners.guild-join.js";
+import {
+  formatDiscordDeployErrorDetails,
+  formatDiscordDeployErrorMessage,
+} from "./provider.deploy-errors.js";
+
+const {
+  clientConstructorOptionsMock,
+  clientDeployCommandsMock,
+  clientFetchUserMock,
+  clientGetPluginMock,
+  createDiscordMessageHandlerMock,
+  createDiscordNativeCommandMock,
+  createdBindingManagers,
+  createThreadBindingManagerMock,
+  getAcpSessionStatusMock,
+  isNativeCommandsExplicitlyDisabledMock,
+  listNativeCommandSpecsForConfigMock,
+  monitorLifecycleMock,
+  reconcileAcpThreadBindingsOnStartupMock,
+  resolveDiscordAccountMock,
+  resolveNativeCommandsEnabledMock,
+  voiceRuntimeModuleLoadedMock,
+} = getProviderMonitorTestMocks();
+
+const { voiceAutoJoinMock, probeDiscordApplicationIdMock } = vi.hoisted(() => ({
+  voiceAutoJoinMock: vi.fn(async () => undefined),
+  probeDiscordApplicationIdMock: vi.fn<typeof import("../probe.js").probeDiscordApplicationId>(),
+}));
+
+let monitorDiscordProvider: typeof import("./provider.js").monitorDiscordProvider;
+
+function createAcpRuntimeError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code });
+}
+
+type MockCallReader = { mock: { calls: unknown[][] } };
+
+function firstMockArg(mock: MockCallReader, label: string) {
+  const firstCall = mock.mock.calls[0];
+  if (!firstCall) {
+    throw new Error(`expected ${label} mock call`);
+  }
+  return firstCall[0];
+}
+
+function mockMessages(mock: unknown): string[] {
+  return (mock as MockCallReader).mock.calls.map(([message]) =>
+    typeof message === "string" ? message : "",
+  );
+}
+
+function expectMockLogContains(mock: unknown, expected: string): void {
+  expect(mockMessages(mock).join("\n")).toContain(expected);
+}
+
+function expectMockLogNotContains(mock: unknown, expected: string): void {
+  expect(mockMessages(mock).join("\n")).not.toContain(expected);
+}
+
+describe("monitorDiscordProvider", () => {
+  type ReconcileHealthProbeParams = {
+    cfg: OpenClawConfig;
+    accountId: string;
+    sessionKey: string;
+    binding: unknown;
+    session: unknown;
+  };
+
+  type ReconcileStartupParams = {
+    cfg: OpenClawConfig;
+    healthProbe?: (
+      params: ReconcileHealthProbeParams,
+    ) => Promise<{ status: string; reason?: string }>;
+  };
+
+  const getHealthProbe = () => {
+    expect(reconcileAcpThreadBindingsOnStartupMock).toHaveBeenCalledTimes(1);
+    const reconcileParams = firstMockArg(
+      reconcileAcpThreadBindingsOnStartupMock,
+      "ACP startup reconciliation",
+    ) as ReconcileStartupParams;
+    if (!reconcileParams?.healthProbe) {
+      throw new Error("healthProbe was not wired into ACP startup reconciliation");
+    }
+    return reconcileParams.healthProbe;
+  };
+  const probe = (name: string, state = "idle", lastActivityAt = Date.now()) =>
+    getHealthProbe()({
+      cfg: baseConfig(),
+      accountId: "default",
+      sessionKey: `agent:test:acp:${name}`,
+      binding: {},
+      session: { acp: { state, lastActivityAt } },
+    });
+  function configureAccount(
+    config: NonNullable<OpenClawConfig["channels"]>["discord"] = {},
+    token = "MTIz.abc.def",
+  ) {
+    resolveDiscordAccountMock.mockReturnValue({
+      accountId: "default",
+      token,
+      config: {
+        commands: { native: true, nativeSkills: false },
+        voice: { enabled: false },
+        agentComponents: { enabled: false },
+        execApprovals: { enabled: false },
+        ...config,
+      },
+    });
+  }
+  function expectIdentityFailureCleanup() {
+    expect(createDiscordMessageHandlerMock).not.toHaveBeenCalled();
+    expect(monitorLifecycleMock).not.toHaveBeenCalled();
+    expect(createdBindingManagers).toHaveLength(1);
+    expect(createdBindingManagers[0]?.stop).toHaveBeenCalledTimes(1);
+  }
+
+  beforeAll(async () => {
+    vi.doMock("../accounts.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../accounts.js")>()),
+      resolveDiscordAccount: (...args: Parameters<typeof resolveDiscordAccountMock>) =>
+        resolveDiscordAccountMock(...args),
+    }));
+    vi.doMock("../probe.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../probe.js")>()),
+      fetchDiscordApplicationId: async () => "app-1",
+      probeDiscordApplicationId: probeDiscordApplicationIdMock,
+    }));
+    vi.doMock("../token.js", () => ({
+      normalizeDiscordToken: (value?: string) => value,
+    }));
+    ({ monitorDiscordProvider } = await import("./provider.js"));
+  });
+
+  beforeEach(() => {
+    resetDiscordProviderMonitorMocks();
+    voiceAutoJoinMock.mockClear();
+    probeDiscordApplicationIdMock.mockReset().mockResolvedValue({
+      kind: "resolved",
+      applicationId: "app-1",
+    });
+    vi.doMock("../voice/listeners.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../voice/listeners.js")>()),
+      DiscordVoiceGuildCreateListener: function DiscordVoiceGuildCreateListener() {},
+      DiscordVoiceReadyListener: function DiscordVoiceReadyListener() {},
+      DiscordVoiceResumedListener: function DiscordVoiceResumedListener() {},
+      DiscordVoiceStateUpdateListener: function DiscordVoiceStateUpdateListener() {},
+    }));
+    // mock-isolation: Keep media/worker initialization outside provider startup fixtures.
+    vi.doMock("../voice/voice-runtime.js", () => {
+      voiceRuntimeModuleLoadedMock();
+      return {
+        DiscordVoiceManager: function DiscordVoiceManager() {
+          return { autoJoin: voiceAutoJoinMock };
+        },
+      };
+    });
+    setActivePluginRegistry(createEmptyPluginRegistry());
+  });
+
+  function runProvider(overrides: Partial<Parameters<typeof monitorDiscordProvider>[0]> = {}) {
+    return monitorDiscordProvider({
+      scheduler: createTestPluginServiceScheduler(),
+      config: baseConfig(),
+      runtime: baseRuntime(),
+      ...overrides,
+    });
+  }
+
+  it("awaits restored thread bindings before reconciliation and provider startup", async () => {
+    const ready = createDeferred<{ stop: ReturnType<typeof vi.fn> }>();
+    const entered = createDeferred<void>();
+    const manager = { stop: vi.fn() };
+    createThreadBindingManagerMock.mockImplementationOnce(() => {
+      entered.resolve();
+      return ready.promise;
+    });
+    const monitor = runProvider();
+    try {
+      await entered.promise;
+      expect(reconcileAcpThreadBindingsOnStartupMock).not.toHaveBeenCalled();
+      expect(monitorLifecycleMock).not.toHaveBeenCalled();
+    } finally {
+      ready.resolve(manager);
+      await monitor;
+    }
+    expect(monitorLifecycleMock).toHaveBeenCalledWith(
+      expect.objectContaining({ threadBindings: manager }),
+    );
+    expect(manager.stop).toHaveBeenCalledTimes(1);
+    expect(voiceRuntimeModuleLoadedMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["binding reconciliation", "interaction registration"] as const)(
+    "stops thread bindings when %s fails before lifecycle begins",
+    async (phase) => {
+      const failure = new Error("startup failed");
+      if (phase === "binding reconciliation") {
+        reconcileAcpThreadBindingsOnStartupMock.mockImplementationOnce(async () => {
+          throw failure;
+        });
+      } else {
+        createDiscordNativeCommandMock.mockImplementationOnce(() => {
+          throw failure;
+        });
+      }
+
+      await expect(
+        monitorDiscordProvider({
+          scheduler: createTestPluginServiceScheduler(),
+          config: baseConfig(),
+          runtime: baseRuntime(),
+        }),
+      ).rejects.toBe(failure);
+
+      expect(monitorLifecycleMock).not.toHaveBeenCalled();
+      expect(createdBindingManagers).toHaveLength(1);
+      expect(createdBindingManagers[0]?.stop).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["binding restoration", "binding reconciliation"] as const)(
+    "stops acquired thread bindings without starting a client when cancelled during %s",
+    async (phase) => {
+      const ready = createDeferred<void>();
+      const entered = createDeferred<void>();
+      const controller = new AbortController();
+      const manager = { stop: vi.fn() };
+      createThreadBindingManagerMock.mockImplementationOnce(async () => {
+        if (phase === "binding restoration") {
+          entered.resolve();
+          await ready.promise;
+        }
+        return manager;
+      });
+      if (phase === "binding reconciliation") {
+        reconcileAcpThreadBindingsOnStartupMock.mockImplementationOnce(async () => {
+          entered.resolve();
+          await ready.promise;
+          return { checked: 0, removed: 0, staleSessionKeys: [] };
+        });
+      }
+      const monitor = runProvider({ abortSignal: controller.signal });
+      try {
+        await entered.promise;
+        controller.abort();
+        expect(manager.stop).not.toHaveBeenCalled();
+        expect(clientConstructorOptionsMock).not.toHaveBeenCalled();
+      } finally {
+        ready.resolve();
+        await monitor;
+      }
+      expect(manager.stop).toHaveBeenCalledTimes(1);
+      expect(clientConstructorOptionsMock).not.toHaveBeenCalled();
+      expect(monitorLifecycleMock).not.toHaveBeenCalled();
+      if (phase === "binding restoration") {
+        expect(reconcileAcpThreadBindingsOnStartupMock).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("disconnects the shared gateway and keeps a late error guard when startup fails before lifecycle begins", async () => {
+    const disconnect = vi.fn();
+    const emitter = new EventEmitter();
+    const gateway = { emitter, disconnect, isConnected: false };
+    const runtime = baseRuntime();
+    clientGetPluginMock.mockImplementation((name: string) =>
+      name === "gateway" ? gateway : undefined,
+    );
+    createDiscordMessageHandlerMock.mockImplementationOnce(() => {
+      throw new Error("handler init failed");
+    });
+
+    await expect(runProvider({ runtime })).rejects.toThrow("handler init failed");
+
+    expect(monitorLifecycleMock).not.toHaveBeenCalled();
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(emitter.listenerCount("error")).toBe(1);
+    expect(() =>
+      emitter.emit("error", new Error("late gateway error after cleanup")),
+    ).not.toThrow();
+  });
+
+  it("joins listener and binding work when message-handler cleanup fails", async () => {
+    const ready = createDeferred<void>();
+    const entered = createDeferred<void>();
+    const bindingReady = createDeferred<void>();
+    const bindingEntered = createDeferred<void>();
+    const failure = new Error("message-handler cleanup failed");
+    const stop = vi.spyOn(DiscordGuildJoinIntroductionListener.prototype, "stop");
+    stop.mockImplementationOnce(async function (this: DiscordGuildJoinIntroductionListener) {
+      entered.resolve();
+      await ready.promise;
+      stop.mockRestore();
+      await this.stop();
+    });
+    const deactivate = vi.fn(async () => {
+      expect(stop).toHaveBeenCalledOnce();
+      throw failure;
+    });
+    createDiscordMessageHandlerMock.mockReturnValueOnce(
+      Object.assign(
+        vi.fn(async () => {}),
+        { deactivate },
+      ),
+    );
+    createThreadBindingManagerMock.mockReturnValueOnce({
+      stop: vi.fn(async () => {
+        bindingEntered.resolve();
+        await bindingReady.promise;
+      }),
+    });
+    const gateway = { emitter: new EventEmitter(), isConnected: true, disconnect: vi.fn() };
+    clientGetPluginMock.mockImplementation((name: string) =>
+      name === "gateway" ? gateway : undefined,
+    );
+    let settled = false;
+    const monitor = runProvider({
+      setStatus: (patch) => {
+        if (patch.connected) {
+          throw new Error("status publication failed before lifecycle");
+        }
+      },
+    }).then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+    try {
+      await entered.promise;
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      ready.resolve();
+      expect(
+        await Promise.race([
+          bindingEntered.promise.then(() => "binding-stop"),
+          monitor.then(() => "completed"),
+        ]),
+      ).toBe("binding-stop");
+      expect(settled).toBe(false);
+    } finally {
+      ready.resolve();
+      bindingReady.resolve();
+      await monitor;
+      stop.mockRestore();
+    }
+    expect(await monitor).toBe(failure);
+    expect(deactivate).toHaveBeenCalledOnce();
+    expect(monitorLifecycleMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before lifecycle when Discord bot identity fetch rejects", async () => {
+    const runtime = baseRuntime();
+    clientFetchUserMock.mockRejectedValueOnce(new Error("identity offline"));
+
+    await expect(runProvider({ runtime })).rejects.toThrow(
+      "Failed to resolve Discord bot identity",
+    );
+
+    expectIdentityFailureCleanup();
+    expectMockLogContains(runtime.error, "identity offline");
+  });
+
+  it("fails closed before lifecycle when Discord bot identity has no usable id", async () => {
+    const runtime = baseRuntime();
+    clientFetchUserMock.mockResolvedValueOnce({ username: "Molty" } as never);
+
+    await expect(runProvider({ runtime })).rejects.toThrow(
+      "Failed to resolve Discord bot identity",
+    );
+
+    expectIdentityFailureCleanup();
+    expectMockLogContains(runtime.error, "no usable id");
+  });
+
+  it("loads the Discord voice runtime for existing voice config blocks", async () => {
+    configureAccount({ voice: {} });
+
+    await runProvider();
+
+    expect(voiceRuntimeModuleLoadedMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps voice-owned commands out of the generic native dispatcher", async () => {
+    configureAccount({ voice: {} });
+    const standard = { name: "normal", description: "Normal", acceptsArgs: false };
+    listNativeCommandSpecsForConfigMock.mockReturnValue([
+      standard,
+      { name: "vc", description: "Shadow voice command", acceptsArgs: false },
+    ]);
+    const createVoiceCommand = vi.spyOn(voiceCommands, "createDiscordVoiceCommand");
+    try {
+      await runProvider();
+      expect(createDiscordNativeCommandMock).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ command: standard }),
+      );
+      expect(createVoiceCommand).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ accountId: "default", getManager: expect.any(Function) }),
+      );
+    } finally {
+      createVoiceCommand.mockRestore();
+    }
+  });
+
+  it("binds native slash commands to the owning Gateway dispatcher", async () => {
+    const channelRuntime = createPluginRuntimeMock().channel;
+    await runProvider({ channelRuntime });
+    expect(createDiscordNativeCommandMock).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        dispatchReplyFromConfig: channelRuntime.reply.dispatchReplyFromConfig,
+        buildContext: channelRuntime.inbound.buildContext,
+      }),
+    );
+  });
+
+  it("registers the native approval runtime context when exec approvals are enabled", async () => {
+    const channelRuntime = createPluginRuntimeMock().channel;
+    const execApprovalsConfig = { enabled: true, approvers: ["123"] };
+    configureAccount({ execApprovals: execApprovalsConfig }, "cfg-token");
+
+    await runProvider({ channelRuntime });
+
+    expect(
+      channelRuntime.runtimeContexts.get({
+        channelId: "discord",
+        accountId: "default",
+        capability: "approval.native",
+      }),
+    ).toEqual({
+      token: "cfg-token",
+      config: execApprovalsConfig,
+    });
+  });
+
+  it.each([
+    ["error status", { state: "error" }, "uncertain", "status-error-state"],
+    [
+      "typed init failure",
+      createAcpRuntimeError("ACP_SESSION_INIT_FAILED", "missing ACP metadata"),
+      "stale",
+      "session-init-failed",
+    ],
+    [
+      "typed backend failure",
+      createAcpRuntimeError("ACP_BACKEND_UNAVAILABLE", "runtime unavailable"),
+      "uncertain",
+      "status-error",
+    ],
+    [
+      "legacy missing session",
+      new Error("ACP session metadata missing"),
+      "stale",
+      "session-missing",
+    ],
+  ] as const)(
+    "classifies ACP %s during startup reconciliation",
+    async (_name, result, status, reason) => {
+      if (result instanceof Error) {
+        getAcpSessionStatusMock.mockRejectedValue(result);
+      } else {
+        getAcpSessionStatusMock.mockResolvedValue(result);
+      }
+      await runProvider();
+      await expect(probe("probe")).resolves.toEqual({ status, reason });
+    },
+  );
+
+  it.each([
+    { state: "idle", lastActivityAt: 600_000, status: "uncertain", reason: "status-timeout" },
+    {
+      state: "running",
+      lastActivityAt: Number.MAX_SAFE_INTEGER,
+      status: "stale",
+      reason: "status-timeout-running-stale",
+    },
+  ])(
+    "aborts a timed-out $state ACP probe and reports $status",
+    async ({ state, lastActivityAt, status, reason }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(600_000);
+      try {
+        getAcpSessionStatusMock.mockImplementation(
+          ({ signal }) =>
+            new Promise((_resolve, reject) => {
+              signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+            }),
+        );
+        await runProvider();
+        const pending = probe("timeout", state, lastActivityAt);
+        await vi.advanceTimersByTimeAsync(8_100);
+        await expect(pending).resolves.toEqual({ status, reason });
+        expect(getAcpSessionStatusMock.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("propagates a nested incognito refusal instead of marking a running session stale", async () => {
+    const error = new AggregateError(
+      [new IncognitoSessionSyncAccessError("resolveSession", "resolveSessionAsync")],
+      "ACP status failed",
+    );
+    getAcpSessionStatusMock.mockRejectedValue(error);
+    await runProvider();
+    await expect(probe("refused", "running", 0)).rejects.toBe(error);
+  });
+
+  it("captures gateway errors emitted before lifecycle wait starts", async () => {
+    const emitter = new EventEmitter();
+    const drained: Array<{ message: string; type: string }> = [];
+    clientGetPluginMock.mockImplementation((name: string) =>
+      name === "gateway" ? { emitter, disconnect: vi.fn() } : undefined,
+    );
+    monitorLifecycleMock.mockImplementationOnce(async (params) => {
+      (
+        params as {
+          gatewaySupervisor?: {
+            drainPending: (
+              handler: (event: { message: string; type: string }) => "continue" | "stop",
+            ) => "continue" | "stop";
+          };
+          threadBindings: { stop: () => void };
+        }
+      ).gatewaySupervisor?.drainPending((event) => {
+        drained.push(event);
+        return "continue";
+      });
+      params.threadBindings.stop();
+    });
+    clientFetchUserMock.mockImplementationOnce(async () => {
+      emitter.emit("error", new Error("Fatal gateway close code: 4014"));
+      return { id: "bot-1" };
+    });
+
+    await runProvider();
+
+    expect(monitorLifecycleMock).toHaveBeenCalledTimes(1);
+    expect(drained).toHaveLength(1);
+    expect(drained[0]?.type).toBe("disallowed-intents");
+    expect(drained[0]?.message).toContain("4014");
+  });
+
+  it("continues startup when Discord daily slash-command create quota is exhausted", async () => {
+    const runtime = baseRuntime();
+    const rateLimitError = new RateLimitError(
+      new Response(null, {
+        status: 429,
+        headers: {
+          "X-RateLimit-Scope": "shared",
+          "X-RateLimit-Bucket": "bucket-1",
+        },
+      }),
+      {
+        message: "Max number of daily application command creates has been reached (200)",
+        retry_after: 193.632,
+        global: false,
+        code: 30034,
+      },
+    );
+    clientDeployCommandsMock.mockRejectedValueOnce(rateLimitError);
+
+    await runProvider({ runtime });
+
+    await vi.waitFor(() => expect(clientDeployCommandsMock).toHaveBeenCalledTimes(1));
+    expect(clientFetchUserMock).toHaveBeenCalledWith("@me");
+    expect(monitorLifecycleMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs native command deploy failures as non-fatal warnings", async () => {
+    const runtime = baseRuntime();
+    clientDeployCommandsMock.mockRejectedValueOnce(new Error("This operation was aborted"));
+
+    await runProvider({ runtime });
+
+    await vi.waitFor(() => expect(clientDeployCommandsMock).toHaveBeenCalledTimes(1));
+    expect(monitorLifecycleMock).toHaveBeenCalledTimes(1);
+    expectMockLogNotContains(runtime.error, "failed to deploy native commands");
+    expect(
+      vi
+        .mocked(runtime.log)
+        .mock.calls.some(
+          (call) =>
+            String(call[0]).includes(
+              "slash command deploy failed (message send/receive unaffected):",
+            ) && String(call[0]).includes("Discord REST request was aborted"),
+        ),
+    ).toBe(true);
+  });
+
+  it("formats native command deploy aborts with REST timeout context", () => {
+    const error = Object.assign(new Error("This operation was aborted"), {
+      name: "AbortError",
+      deployRestMethod: "patch",
+      deployRestPath: "/applications/app-1/commands/cmd-1",
+      deployRequestMs: 24_657,
+      deployTimeoutMs: 15_000,
+    });
+
+    expect(formatDiscordDeployErrorMessage(error)).toBe(
+      "Discord REST PATCH /applications/app-1/commands/cmd-1 timed out (timeout=15s, observed=24.7s)",
+    );
+  });
+
+  it("skips native command deploy retries after one rate limit warning", async () => {
+    const runtime = baseRuntime();
+    const rateLimitError = new RateLimitError(
+      new Response(null, {
+        status: 429,
+      }),
+      {
+        message: "You are being rate limited.",
+        retry_after: 0,
+        global: false,
+      },
+    );
+    clientDeployCommandsMock.mockRejectedValue(rateLimitError);
+
+    await runProvider({ runtime });
+
+    await vi.waitFor(() => expect(clientDeployCommandsMock).toHaveBeenCalledTimes(1));
+    const warningMessages = vi
+      .mocked(runtime.log)
+      .mock.calls.map((call) => String(call[0]))
+      .filter((message) => message.includes("slash command deploy rate limited"));
+    expect(warningMessages).toHaveLength(1);
+    expect(warningMessages[0]).toContain("retry after 0s");
+    expect(warningMessages[0]).toContain("Message send/receive is unaffected.");
+    expect(warningMessages[0]).not.toContain("body=");
+    expectMockLogNotContains(runtime.error, "native-slash-command-deploy-rest");
+  });
+
+  it("uses the native REST retry fallback for malformed Discord retry_after values", async () => {
+    const rest = new RequestClient("synthetic-token", {
+      queueRequests: false,
+      fetch: async () =>
+        Response.json(
+          {
+            message: "You are being rate limited.",
+            retry_after: "0x2",
+            global: false,
+          },
+          { status: 429 },
+        ),
+    });
+    await expect(
+      rest
+        .get("/applications/app-1/commands")
+        .catch((error: unknown) => formatDiscordDeployErrorDetails(error)),
+    ).resolves.toBe(" (status=429, retryAfter=1s, scope=route)");
+  });
+
+  it("keeps truncated Discord deploy response bodies UTF-16 safe", () => {
+    const prefix = "a".repeat(798);
+    const details = formatDiscordDeployErrorDetails({
+      rawBody: `${prefix}😀tail`,
+    });
+
+    expect(details).toBe(` (body="${prefix}...)`);
+  });
+
+  it("formats rejected Discord deploy entries with command details", () => {
+    const details = formatDiscordDeployErrorDetails({
+      status: 400,
+      discordCode: 50035,
+      rawBody: {
+        code: 50035,
+        message: "Invalid Form Body",
+        errors: Object.fromEntries(
+          [63, 65, 66, 67].map((index) => [
+            index,
+            {
+              description: {
+                _errors: [{ code: "BASE_TYPE_MAX_LENGTH", message: "Must be 100 or fewer." }],
+              },
+            },
+          ]),
+        ),
+      },
+      deployRequestBody: Array.from({ length: 68 }, (_entry, index) => ({
+        name: `command-${index}`,
+        description: `description-${index}`,
+      })),
+    });
+
+    expect(details).toContain("status=400");
+    expect(details).toContain("code=50035");
+    expect(details).toContain("body=");
+    expect(details).toContain("rejected=");
+    expect(details).toContain(
+      '#63 fields=description name=command-63 description="description-63"',
+    );
+    expect(details).toContain(
+      '#65 fields=description name=command-65 description="description-65"',
+    );
+    expect(details).toContain(
+      '#66 fields=description name=command-66 description="description-66"',
+    );
+    expect(details).not.toContain("command-67");
+  });
+
+  it("skips slash-command lifecycle REST when native commands are disabled", async () => {
+    const runtime = baseRuntime();
+    isNativeCommandsExplicitlyDisabledMock.mockReturnValue(true);
+    resolveNativeCommandsEnabledMock.mockReturnValue(false);
+    configureAccount({
+      applicationId: "987654321098765432",
+      commands: { native: false, nativeSkills: false },
+    });
+
+    await runProvider({ runtime });
+
+    expect(listNativeCommandSpecsForConfigMock).not.toHaveBeenCalled();
+    expect(clientDeployCommandsMock).not.toHaveBeenCalled();
+    expectMockLogNotContains(runtime.log, "cleared native commands");
+  });
+
+  it.each([
+    {
+      name: "401 rejection",
+      result: { kind: "rejected" as const, status: 401 as const, error: new Error("Unauthorized") },
+      lifecycle: "blocked",
+      terminalDisconnect: true,
+    },
+
+    {
+      name: "network failure",
+      result: { kind: "unavailable" as const, status: null, error: new Error("fetch failed") },
+      lifecycle: "recovering",
+      terminalDisconnect: undefined,
+    },
+  ])(
+    "publishes $lifecycle for an application-id $name before gateway startup",
+    async ({ result, lifecycle, terminalDisconnect }) => {
+      const setStatus = vi.fn();
+      probeDiscordApplicationIdMock.mockResolvedValueOnce(result);
+      configureAccount({}, "unparseable.token");
+
+      await expect(runProvider({ setStatus })).rejects.toThrow(
+        "Failed to resolve Discord application id",
+      );
+
+      expect(setStatus).toHaveBeenCalledWith(
+        expect.objectContaining({
+          connected: false,
+          lifecycle,
+          terminalDisconnect,
+          lastDisconnect:
+            result.status === null
+              ? expect.not.objectContaining({ status: expect.anything() })
+              : expect.objectContaining({ status: result.status }),
+        }),
+      );
+      expect(clientConstructorOptionsMock).not.toHaveBeenCalled();
+      expect(monitorLifecycleMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("publishes ready and disconnected status across the gateway lifecycle", async () => {
+    const gateway = { emitter: new EventEmitter(), isConnected: true };
+    clientGetPluginMock.mockImplementation((name: string) =>
+      name === "gateway" ? gateway : undefined,
+    );
+    const setStatus = vi.fn();
+
+    await runProvider({ setStatus });
+
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ connected: true, lifecycle: "ready" }),
+    );
+    expect(setStatus).toHaveBeenCalledWith(expect.objectContaining({ connected: false }));
+  });
+});

@@ -1,0 +1,73 @@
+import { asNullableRecord as getRecord } from "@openclaw/normalization-core/record-coerce";
+import { isSafeExecutableValue } from "../infra/exec-safety.js";
+
+export { ensureRecord } from "@openclaw/normalization-core/record-coerce";
+export { getRecord };
+export type LegacyConfigRule = {
+  path: string[];
+  message: string;
+  match?: (value: unknown, root: Record<string, unknown>) => boolean;
+  // If true, only report when the legacy value is present in the original parsed
+  // source (not only after include/env resolution).
+  requireSourceLiteral?: boolean;
+};
+
+export const createLegacyConfigRule = (
+  path: string[],
+  message: string,
+  match?: LegacyConfigRule["match"],
+): LegacyConfigRule => ({
+  path,
+  message: `${message} Run "openclaw doctor --fix".`,
+  ...(match ? { match } : {}),
+});
+
+export type LegacyConfigMigrationContext = {
+  /** Parsed configuration exactly as authored in the root config file. */
+  authoredRaw: unknown;
+  /** Configuration after include and environment resolution. */
+  resolvedRaw: unknown;
+  env?: NodeJS.ProcessEnv;
+  homedir?: () => string;
+};
+
+export type LegacyConfigMigrationSpec = {
+  id: string;
+  legacyRules?: LegacyConfigRule[];
+  apply: (
+    raw: Record<string, unknown>,
+    changes: string[],
+    context?: LegacyConfigMigrationContext,
+  ) => void;
+};
+
+export const mapLegacyAudioTranscription = (value: unknown): Record<string, unknown> | null => {
+  const transcriber = getRecord(value);
+  const command = Array.isArray(transcriber?.command) ? transcriber?.command : null;
+  if (!command || command.length === 0) {
+    return null;
+  }
+  if (typeof command[0] !== "string") {
+    return null;
+  }
+  if (!command.every((part) => typeof part === "string")) {
+    return null;
+  }
+  const rawExecutable = command[0].trim();
+  if (!isSafeExecutableValue(rawExecutable)) {
+    return null;
+  }
+
+  const args = command.slice(1).map((part) => part.replace(/\{input\}/g, "{{AttachmentPath}}"));
+  const timeoutSeconds =
+    typeof transcriber?.timeoutSeconds === "number" ? transcriber?.timeoutSeconds : undefined;
+
+  const result: Record<string, unknown> = { command: rawExecutable, type: "cli" };
+  if (args.length > 0) {
+    result.args = args;
+  }
+  if (timeoutSeconds !== undefined) {
+    result.timeoutSeconds = timeoutSeconds;
+  }
+  return result;
+};

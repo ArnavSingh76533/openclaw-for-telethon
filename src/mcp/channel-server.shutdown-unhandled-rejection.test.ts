@@ -1,0 +1,108 @@
+import { setImmediate } from "node:timers/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const transportState = vi.hoisted(() => ({
+  lastTransport: null as { onclose?: (() => void) | undefined } | null,
+}));
+const serverState = vi.hoisted(() => ({
+  close: vi.fn(async () => {}),
+}));
+const bridgeState = vi.hoisted(() => ({
+  close: vi.fn(async () => {
+    throw new Error("close boom");
+  }),
+}));
+
+vi.mock("@modelcontextprotocol/server/stdio", () => ({
+  StdioServerTransport: class MockStdioServerTransport {
+    onclose?: () => void;
+
+    constructor() {
+      transportState.lastTransport = this;
+    }
+  },
+}));
+
+vi.mock("@modelcontextprotocol/server", () => ({
+  McpServer: class MockMcpServer {
+    registerTool() {}
+
+    server = { setNotificationHandler: vi.fn() };
+    async connect() {}
+    close = serverState.close;
+  },
+}));
+
+// mock-isolation: Shutdown fixtures use empty config without starting a real config owner.
+vi.mock("../config/config.js", () => ({
+  getRuntimeConfig: vi.fn(() => ({})),
+  captureRuntimeConfigAsyncReader: () => async () => ({}),
+}));
+
+// mock-isolation: Inject a bridge-close failure without starting a real Gateway bridge.
+vi.mock("./channel-bridge.js", () => ({
+  OpenClawChannelBridge: class MockOpenClawChannelBridge {
+    setServer() {}
+    async start() {}
+    close = bridgeState.close;
+    async handleClaudePermissionRequest() {}
+  },
+}));
+
+async function waitForTransport(): Promise<{ onclose?: (() => void) | undefined }> {
+  return vi.waitFor(() => {
+    if (!transportState.lastTransport) {
+      throw new Error("MCP stdio transport was not created");
+    }
+    return transportState.lastTransport;
+  });
+}
+
+describe("serveOpenClawChannelMcp shutdown", () => {
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason);
+  };
+
+  afterEach(() => {
+    process.off("unhandledRejection", onUnhandledRejection);
+    unhandledRejections.length = 0;
+    transportState.lastTransport = null;
+    serverState.close.mockClear();
+    bridgeState.close.mockClear();
+  });
+
+  it("rejects without leaking unhandled rejections and attempts every cleanup owner", async () => {
+    process.on("unhandledRejection", onUnhandledRejection);
+    const { serveOpenClawChannelMcp } = await import("./channel-server.js");
+
+    const servePromise = serveOpenClawChannelMcp({ verbose: false });
+    const transport = await waitForTransport();
+
+    transport.onclose?.();
+    await expect(servePromise).rejects.toThrow("close boom");
+    await setImmediate();
+
+    expect(unhandledRejections).toStrictEqual([]);
+    expect(bridgeState.close).toHaveBeenCalledTimes(1);
+    expect(serverState.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("aggregates bridge and MCP server close failures", async () => {
+    serverState.close.mockRejectedValueOnce(new Error("server close boom"));
+    const { serveOpenClawChannelMcp } = await import("./channel-server.js");
+
+    const servePromise = serveOpenClawChannelMcp({ verbose: false });
+    const transport = await waitForTransport();
+    transport.onclose?.();
+
+    const error = await servePromise.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "close boom" }),
+      expect.objectContaining({ message: "server close boom" }),
+    ]);
+    expect(bridgeState.close).toHaveBeenCalledTimes(1);
+    expect(serverState.close).toHaveBeenCalledTimes(1);
+  });
+});
