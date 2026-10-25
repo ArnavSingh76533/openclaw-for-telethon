@@ -1,0 +1,21 @@
+{
+  "base_commit": "a56864b779b25031096d07a126f34810c8736af2",
+  "changed_files": 53,
+  "extension_files": 522,
+  "patch_applies_to_base": true,
+  "credential_scan": "passed",
+  "artifacts": {
+    "telegram-telethon.patch": {
+      "bytes": 411104,
+      "sha256": "c71a1bba0b4d3de03d92f66de6924101e16937b5fb305b6c20451fa78d9627cb"
+    },
+    "telegram-telethon-extension.zip": {
+      "bytes": 1635159,
+      "sha256": "203fb8772791c62365d39677dd1b8212182b0780d74e48e2b3fcfaf542d990fe"
+    },
+    "openclaw_telethon-0.1.0-py3-none-any.whl": {
+      "bytes": 44139,
+      "sha256": "96d5480cc4c1b11f8a91951f76745925d20b95b9fdd2660b6805b8bcdd1816ab"
+    }
+  }
+}
