@@ -1,0 +1,39 @@
+{
+  "id": "antigravity-cli",
+  "name": "Antigravity CLI (AGY)",
+  "description": "Optional CLI-owned Google login and models; subject to Google's Antigravity terms.",
+  "categories": ["models"],
+  "providers": ["antigravity-cli"],
+  "syntheticAuthRefs": ["antigravity-cli"],
+  "modelCatalog": {
+    "discovery": { "antigravity-cli": "runtime" },
+    "providers": {
+      "antigravity-cli": {
+        "authScope": "plugin",
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1/agy-cli-owned-transport",
+        "models": []
+      }
+    }
+  },
+  "providerAuthChoices": [
+    {
+      "provider": "antigravity-cli",
+      "method": "google-cli",
+      "choiceId": "antigravity-cli-google",
+      "choiceLabel": "Antigravity CLI Google sign-in",
+      "choiceHint": "Optional subscription login through official agy",
+      "appGuidedAuth": "oauth"
+    }
+  ],
+  "nonSecretAuthMarkers": ["agy-cli-owned-auth"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "command": { "type": "string", "minLength": 1, "default": "agy" },
+      "homeDir": { "type": "string", "minLength": 1 },
+      "timeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 1800, "default": 300 }
+    }
+  }
+}
