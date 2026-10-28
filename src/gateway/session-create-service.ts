@@ -503,8 +503,10 @@ async function createGatewaySessionInScope(
         );
       if (
         parentHasActiveWork &&
-        (params.emitCommandHooks === true ||
-          (params.forkFrom !== "last-completed" && !params.activeParentFork))
+        ((params.emitCommandHooks === true && params.succeedsParent !== false) ||
+          (params.fork === true &&
+            params.forkFrom !== "last-completed" &&
+            !params.activeParentFork))
       ) {
         return unavailableSessionRequest(
           `Parent session ${parentSessionKey} is still active; try again in a moment.`,
