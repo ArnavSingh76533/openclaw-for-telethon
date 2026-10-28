@@ -3,6 +3,7 @@
   "name": "Antigravity CLI (AGY)",
   "description": "Optional CLI-owned Google login and models; subject to Google's Antigravity terms.",
   "categories": ["models"],
+  "activation": { "onStartup": true },
   "providers": ["antigravity-cli"],
   "syntheticAuthRefs": ["antigravity-cli"],
   "modelCatalog": {

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import plugin, { streamFor } from "../index.mjs";
 import { parseResponse } from "../bridge.mjs";
 import { validateToolArguments } from "openclaw/plugin-sdk/llm";
+import manifest from "../openclaw.plugin.json" with { type: "json" };
 
 test("real SDK: plugin registers Models auth, catalog and stream without changing defaults", () => {
   let provider, catalog;
@@ -16,6 +17,9 @@ test("real SDK: plugin registers Models auth, catalog and stream without changin
     },
   });
   assert.equal(provider.id, "antigravity-cli");
+  assert.equal(manifest.activation.onStartup, true);
+  assert.equal(manifest.modelCatalog.providers[provider.id].authScope, provider.authScope);
+  assert.equal(manifest.providerAuthChoices[0].appGuidedAuth, "oauth");
   assert.equal(provider.auth[0].kind, "oauth");
   assert.equal(catalog.provider, provider.id);
   assert.equal(typeof provider.createStreamFn(), "function");

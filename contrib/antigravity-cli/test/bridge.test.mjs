@@ -52,6 +52,12 @@ test("model discovery preserves exact IDs and rejects an empty catalog", () => {
     ["gemini-4-high", "claude-x"],
   );
   assert.throws(() => parseModels("Authentication required"), /no models/);
+  assert.deepEqual(
+    parseModels(
+      "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n",
+    ).map((m) => m.id),
+    ["gemini-3.8-flash-high", "claude-sonnet-4-6"],
+  );
 });
 test("child environment does not inherit API keys or AGY overrides", () => {
   const env = childEnv("/private", {

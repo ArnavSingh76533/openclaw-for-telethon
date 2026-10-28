@@ -13,13 +13,13 @@ The approach comes from the community `antigravity-oauth` entry in the official 
 Requires OpenClaw 2026.10.6 or later, Node 24, and the [official Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli). The tested CLI is 1.4.8.
 
 1. Install `agy` from Google's official instructions on the machine running the Gateway.
-2. Run `openclaw plugins install /path/to/openclaw-agy-0.1.1.tgz` and enable `antigravity-cli` if prompted. Restart the Gateway.
+2. Run `openclaw plugins install /path/to/openclaw-agy-0.1.2.tgz` and enable `antigravity-cli` if prompted. Restart the Gateway.
 3. Open **Settings → Models → Connect provider → Antigravity CLI Google sign-in**. Review the notice, copy the official Google sign-in URL into a new browser tab, complete consent yourself, and return to the visible masked OpenClaw field to paste Google's authorization code. AGY expires its login attempt after 60 seconds; retry if needed. This is manual code entry; it does not wait for an automatic OpenClaw browser callback.
 4. Choose an exact `antigravity-cli/<model-id>` from Models. Setup does not change your existing default model. You can select a model for one conversation first.
 
 The provider uses its own HOME at `$OPENCLAW_STATE_DIR/agy-home` (normally `~/.openclaw/agy-home`). AGY owns its credentials there; include this directory in private OpenClaw backups. Do not publish it. An existing Gmail browser login is separate from CLI authentication.
 
-For an ephemeral Docker host such as Hugging Face, put the plugin source in the image and install it as a local link. OpenClaw's native backups deliberately omit managed npm directories, so an npm-pack install alone will not survive a fresh container restore. The Space uses `/home/node/agy-plugin` with its `node_modules/openclaw` link pointing to `/opt/openclaw`; its managed install record and load path are retained in the private state backup. The CLI executable and CLI-owned Google HOME live inside the backed-up state.
+For an ephemeral Docker host such as Hugging Face, put the plugin source and official CLI executable in the image and install the plugin as a local link. OpenClaw's native backups deliberately omit managed npm directories, so an npm-pack install alone will not survive a fresh container restore. The Space uses `/home/node/agy-plugin` with its `node_modules/openclaw` link pointing to `/opt/openclaw`, and `/home/node/agy-bin/agy` for the CLI. Its managed install record, load path, and CLI-owned Google HOME are retained in the private state backup. Keeping the executable in the image avoids adding a large regenerable binary to every credential checkpoint.
 
 Optional plugin configuration in `plugins.entries.antigravity-cli.config`:
 
@@ -37,7 +37,7 @@ Optional plugin configuration in `plugins.entries.antigravity-cli.config`:
 
 - Model IDs and labels come from `agy models`; no invented catalog or silent fallback. Effort suffixes are preserved verbatim. Token limits are conservative defaults (32,768 context, 8,192 output), because the CLI catalog does not publish them.
 - Each completion sends the complete OpenClaw text conversation, system prompt, and currently allowed tool schemas to a fresh CLI conversation. OpenClaw remains responsible for compaction, tool execution, and approvals.
-- CLI native file, command, web, and MCP operations are denied in a private provider-owned settings file. Requests use a disposable working directory, not your agent's workspace. A native tool event aborts the response.
+- CLI native file, command, web, and MCP operations are denied in a private provider-owned settings file. Requests use a disposable working directory, not your agent's workspace. A native tool event aborts the response, except AGY's internal `finish` event used to deliver the structured result.
 - OpenClaw tool calls use AGY structured output, validate against the actual tool schema, and return through OpenClaw's normal tool loop. There is no additional tool executor.
 - Text only. Attachments produce an explicit error; images, audio, and video are not silently dropped. Select another provider for those requests.
 - Replies appear when the structured result completes; token-by-token streaming and separate reasoning controls are not implemented. Subscription usage tokens are reported when the CLI supplies them; zero monetary cost fields mean pricing is unknown, not that Google usage is free.
@@ -53,3 +53,5 @@ node --import "$OPENCLAW_SOURCE_ROOT/scripts/tsx.mjs" --import ./test/sdk-loader
 ```
 
 Fixture tests do not prove live Google inference. A real account login and a live OpenClaw tool round trip must be verified separately.
+
+Version 0.1.2 was also verified against AGY 1.4.8 with live Google model discovery, an exact text response, a structured tool request/result round trip, and an OpenClaw agent run using `session_status`. The OpenClaw run receipt confirmed the requested AGY provider/model and no rerouting. Account eligibility, quotas, and future CLI changes remain external dependencies.

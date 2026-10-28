@@ -63,6 +63,12 @@ if (args[0] === "models") {
       },
     },
   };
+  console.log(
+    JSON.stringify({
+      event: "step_update",
+      step_update: { step_type: "tool", tool_name: "finish", state: "ACTIVE" },
+    }),
+  );
   const encoded = JSON.stringify(response) + "\n";
   process.stdout.write(encoded.slice(0, 35));
   setTimeout(() => process.stdout.write(encoded.slice(35)), 10);

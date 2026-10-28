@@ -167,7 +167,7 @@ export function parseModels(output) {
   const result = [],
     seen = new Set();
   for (const raw of output.split(/\r?\n/)) {
-    const match = raw.trim().match(/^([a-zA-Z0-9][a-zA-Z0-9._:/-]*)\s{2,}(.+)$/);
+    const match = raw.trim().match(/^([a-zA-Z0-9][a-zA-Z0-9._:/-]*)(?:\t+| {2,})(.+)$/);
     if (!match || /^(id|model|model_id)$/i.test(match[1]) || seen.has(match[1])) continue;
     seen.add(match[1]);
     result.push({
@@ -318,7 +318,12 @@ export async function complete(options, model, context, { signal, validate } = {
         signal,
         input: `${JSON.stringify({ event: "user", message: { content: request.prompt } })}\n`,
         onLine(event) {
-          if (event.event === "step_update" && event.step_update?.step_type === "tool")
+          // AGY implements schema completion as its internal `finish` tool; it has no host action.
+          if (
+            event.event === "step_update" &&
+            event.step_update?.step_type === "tool" &&
+            event.step_update.tool_name !== "finish"
+          )
             throw new Error("AGY attempted a native tool; only OpenClaw tools are supported.");
           if (event.event === "result") {
             result = event.result;
