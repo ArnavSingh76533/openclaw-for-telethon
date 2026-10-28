@@ -15,7 +15,7 @@ import {
   settings,
   DENY,
 } from "../bridge.mjs";
-import { findLoginUrl, login } from "../login.mjs";
+import { findLoginUrl, login, loginFailure } from "../login.mjs";
 
 const tool = {
   name: "lookup",
@@ -163,72 +163,83 @@ test("declining login never starts a CLI process", async () => {
   );
   assert.equal(spawned, false);
 });
-test("login delegates code entry to the CLI and disposes the PTY", async (t) => {
-  const opts = await setup(t);
-  let data,
-    exit,
-    wrote,
-    opened,
-    killed = false,
-    disposed = 0;
-  const codeUrl =
-    "https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback";
-  const ctx = {
-    prompter: {
-      note: async () => {},
-      confirm: async () => true,
-      text: async (prompt) => {
-        assert.equal(prompt.sensitive, true);
-        return "user-code";
-      },
-    },
-    openUrl: async (url) => {
-      opened = url;
-    },
-    assertCurrent: () => {},
-  };
-  const spawn = async (params) => {
-    assert.deepEqual(params.args.slice(0, 2), ["-p", "Reply with exactly: OK"]);
-    queueMicrotask(() =>
-      setImmediate(() =>
-        data(
-          "Authentication required. " +
-            codeUrl +
-            "\nOr, paste the authorization code here and press Enter:\n",
-        ),
-      ),
-    );
-    return {
-      onData(cb) {
-        data = cb;
+for (const exitCode of [0, 7])
+  test(
+    `login delegates code entry and checks session after exit ${exitCode}`,
+    { skip: process.platform === "win32" && exitCode !== 0 },
+    async (t) => {
+      const opts = await setup(t);
+      let data,
+        exit,
+        wrote,
+        opened,
+        killed = false,
+        disposed = 0;
+      const codeUrl =
+        "https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback";
+      const ctx = {
+        prompter: {
+          note: async () => {},
+          confirm: async () => true,
+          text: async (prompt) => {
+            assert.equal(prompt.sensitive, true);
+            return "user-code";
+          },
+        },
+        openUrl: async (url) => {
+          opened = url;
+        },
+        assertCurrent: () => {},
+      };
+      const spawn = async (params) => {
+        assert.deepEqual(params.args.slice(0, 2), ["-p", "Reply with exactly: OK"]);
+        queueMicrotask(() =>
+          setImmediate(() =>
+            data(
+              "Authentication required. " +
+                codeUrl +
+                "\nOr, paste the authorization code here and press Enter:\n",
+            ),
+          ),
+        );
         return {
-          dispose() {
-            disposed++;
+          onData(cb) {
+            data = cb;
+            return {
+              dispose() {
+                disposed++;
+              },
+            };
+          },
+          onExit(cb) {
+            exit = cb;
+            return {
+              dispose() {
+                disposed++;
+              },
+            };
+          },
+          write(value) {
+            wrote = value;
+            setImmediate(() => exit({ exitCode }));
+          },
+          kill() {
+            killed = true;
           },
         };
-      },
-      onExit(cb) {
-        exit = cb;
-        return {
-          dispose() {
-            disposed++;
-          },
-        };
-      },
-      write(value) {
-        wrote = value;
-        setImmediate(() => exit({ exitCode: 0 }));
-      },
-      kill() {
-        killed = true;
-      },
-    };
-  };
-  await login(opts, ctx, spawn);
-  assert.equal(wrote, "user-code\r");
-  assert.equal(opened, codeUrl);
-  assert.equal(killed, true);
-  assert.equal(disposed, 2);
+      };
+      await login(opts, ctx, spawn);
+      assert.equal(wrote, "user-code\r");
+      assert.equal(opened, undefined);
+      assert.equal(killed, true);
+      assert.equal(disposed, 2);
+    },
+  );
+test("login errors explain expiry without exposing raw diagnostics", () => {
+  assert.match(loginFailure("Authentication timed out SECRET", false).message, /timed out/);
+  assert.match(loginFailure("invalid_grant SECRET", true).message, /cannot be reused/);
+  assert.match(loginFailure("dbus SECRET", true).message, /credential store/);
+  assert.equal(loginFailure("SECRET", true).message.includes("SECRET"), false);
 });
 test("canceling a running login closes its PTY", async (t) => {
   const opts = await setup(t),

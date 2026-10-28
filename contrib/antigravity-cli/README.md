@@ -13,11 +13,13 @@ The approach comes from the community `antigravity-oauth` entry in the official 
 Requires OpenClaw 2026.10.6 or later, Node 24, and the [official Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli). The tested CLI is 1.4.8.
 
 1. Install `agy` from Google's official instructions on the machine running the Gateway.
-2. Run `openclaw plugins install /path/to/openclaw-agy-0.1.0.tgz` and enable `antigravity-cli` if prompted. Restart the Gateway.
-3. Open **Settings → Models → Add provider → Antigravity CLI (AGY) → Google sign-in through AGY**. Review the notice, open the official Google sign-in URL, complete consent yourself, and paste Google's authorization code into the masked OpenClaw field. AGY expires its login attempt after 60 seconds; retry if needed.
+2. Run `openclaw plugins install /path/to/openclaw-agy-0.1.1.tgz` and enable `antigravity-cli` if prompted. Restart the Gateway.
+3. Open **Settings → Models → Connect provider → Antigravity CLI Google sign-in**. Review the notice, copy the official Google sign-in URL into a new browser tab, complete consent yourself, and return to the visible masked OpenClaw field to paste Google's authorization code. AGY expires its login attempt after 60 seconds; retry if needed. This is manual code entry; it does not wait for an automatic OpenClaw browser callback.
 4. Choose an exact `antigravity-cli/<model-id>` from Models. Setup does not change your existing default model. You can select a model for one conversation first.
 
 The provider uses its own HOME at `$OPENCLAW_STATE_DIR/agy-home` (normally `~/.openclaw/agy-home`). AGY owns its credentials there; include this directory in private OpenClaw backups. Do not publish it. An existing Gmail browser login is separate from CLI authentication.
+
+For an ephemeral Docker host such as Hugging Face, put the plugin source in the image and install it as a local link. OpenClaw's native backups deliberately omit managed npm directories, so an npm-pack install alone will not survive a fresh container restore. The Space uses `/home/node/agy-plugin` with its `node_modules/openclaw` link pointing to `/opt/openclaw`; its managed install record and load path are retained in the private state backup. The CLI executable and CLI-owned Google HOME live inside the backed-up state.
 
 Optional plugin configuration in `plugins.entries.antigravity-cli.config`:
 

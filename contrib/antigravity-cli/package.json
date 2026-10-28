@@ -1,6 +1,6 @@
 {
   "name": "@arnav/openclaw-agy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Opt-in Antigravity CLI model provider for OpenClaw",
   "license": "MIT",
   "files": [

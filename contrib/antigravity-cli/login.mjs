@@ -1,4 +1,24 @@
-import { childEnv, prepareHome } from "./bridge.mjs";
+import { childEnv, discover, prepareHome } from "./bridge.mjs";
+
+export function loginFailure(output, submitted) {
+  if (/timed out|deadline exceeded|authentication timeout|timeout waiting/i.test(output))
+    return new Error(
+      "The AGY sign-in timed out. Start again and submit the new Google code within 60 seconds.",
+    );
+  if (/invalid_grant|invalid.*authorization code/i.test(output))
+    return new Error(
+      "Google rejected this authorization code. Start a fresh sign-in; codes cannot be reused.",
+    );
+  if (/keyring|secret service|credential.*stor|dbus/i.test(output))
+    return new Error(
+      "AGY could not save its Google session. Check the CLI credential store and provider HOME permissions.",
+    );
+  return new Error(
+    submitted
+      ? "AGY could not complete Google sign-in or account setup. Check account access and retry."
+      : "AGY closed before receiving the Google code. Start a fresh sign-in and submit the code in OpenClaw.",
+  );
+}
 
 export function findLoginUrl(text) {
   const match = text.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?[^\s\x1b]+/);
@@ -37,7 +57,8 @@ export async function login(options, ctx, spawnPty) {
   );
   let output = "",
     settled = false,
-    urlStarted = false;
+    urlStarted = false,
+    submitted = false;
   let dataSubscription, exitSubscription, timer;
   const abort = new AbortController();
   const cancel = () => abort.abort(ctx.signal?.reason);
@@ -57,18 +78,25 @@ export async function login(options, ctx, spawnPty) {
       );
       if (abort.signal.aborted) return finish(new Error("AGY login canceled."));
       timer = setTimeout(() => abort.abort(), 180000);
-      exitSubscription = terminal.onExit(({ exitCode }) =>
-        finish(
-          exitCode === 0
-            ? undefined
-            : new Error(
-                "AGY login did not complete. Restart sign-in and finish within the CLI time limit.",
-              ),
-        ),
-      );
+      exitSubscription = terminal.onExit(({ exitCode }) => {
+        if (exitCode === 0) return finish();
+        if (!submitted || abort.signal.aborted) return finish(loginFailure(output, submitted));
+        // Login may succeed even when the CLI's initial default-model prompt has no quota.
+        void (async () => {
+          try {
+            ctx.assertCurrent?.();
+            await discover(options, abort.signal);
+            ctx.assertCurrent?.();
+            finish();
+          } catch {
+            finish(loginFailure(output, submitted));
+          }
+        })();
+      });
       dataSubscription = terminal.onData((chunk) => {
-        if (settled || urlStarted) return;
+        if (settled) return;
         output = (output + chunk).slice(-65536).replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
+        if (urlStarted) return;
         try {
           const url = findLoginUrl(output);
           if (!url || !output.includes("paste the authorization code")) return;
@@ -76,10 +104,10 @@ export async function login(options, ctx, spawnPty) {
           void (async () => {
             ctx.assertCurrent?.();
             await ctx.prompter.note(
-              `Open this official Google URL and complete sign-in yourself:\n${url}\n\nOnly continue a sign-in you started. The CLI expires this attempt after 60 seconds.`,
+              `Copy this official Google URL into a new browser tab:\n${url}\n\nComplete Google sign-in, then return to this OpenClaw tab and paste the code below within 60 seconds. Only continue a sign-in you started.`,
               "Google sign-in",
             );
-            await ctx.openUrl(url);
+            // AGY uses an out-of-band code, not OpenClaw's automatic browser callback.
             const code = await ctx.prompter.text({
               message: "Paste the authorization code shown by Google",
               sensitive: true,
@@ -92,6 +120,7 @@ export async function login(options, ctx, spawnPty) {
             if (settled) return;
             abort.signal.throwIfAborted();
             ctx.assertCurrent?.();
+            submitted = true;
             terminal.write(`${code.trim()}\r`);
           })().catch(finish);
         } catch (error) {
