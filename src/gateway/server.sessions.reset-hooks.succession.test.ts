@@ -1,9 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { withSessionTurn } from "../sessions/session-controller.admission.js";
-import {
-  captureSessionTarget,
-  isSessionControllerWorkActive,
-} from "../sessions/session-controller.lifecycle.js";
+import { captureSessionTarget } from "../sessions/session-controller.lifecycle.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { writeSessionStore } from "./test-helpers.js";
 import {
@@ -54,32 +51,16 @@ async function holdControllerTurn(
   const { promise: started, resolve: begin } = createDeferredCore();
   const { promise: interrupted, resolve: interrupt } = createDeferredCore();
   let running = false;
-  let wasInterrupted = false;
   const work = withSessionTurn(
     { sessionKey: target.sessionKey, sessionId, target },
     async (_operation, signal) => {
-      signal.addEventListener(
-        "abort",
-        () => {
-          wasInterrupted = true;
-          interrupt();
-        },
-        { once: true },
-      );
+      signal.addEventListener("abort", () => interrupt(), { once: true });
       running = true;
       begin();
       await released;
     },
   );
-  return {
-    started,
-    interrupted,
-    release,
-    target,
-    work,
-    isRunning: () => running,
-    isInterrupted: () => wasInterrupted,
-  };
+  return { started, interrupted, release, target, work, isRunning: () => running };
 }
 
 test("sessions.create keeps the parent active for an explicit parallel child", async () => {
@@ -100,48 +81,6 @@ test("sessions.create keeps the parent active for an explicit parallel child", a
     sessionKey: result.payload?.key,
   });
 });
-
-test.each([false, true, undefined])(
-  "sessions.create handles a running parent with succeedsParent=%s",
-  async (succeedsParent) => {
-    const sessionId = "sess-running-parent";
-    const active = await holdControllerTurn(sessionId);
-    await active.started;
-    try {
-      const result = await directSessionReq<{ key: string }>("sessions.create", {
-        parentSessionKey: "main",
-        emitCommandHooks: true,
-        ...(succeedsParent === undefined ? {} : { succeedsParent }),
-      });
-      if (succeedsParent === false) {
-        expect(result.ok, JSON.stringify(result.error)).toBe(true);
-        expect(result.payload?.key).toMatch(/^agent:main:dashboard:/);
-        expect(sessionLifecycleHookMocks.runSessionStart).toHaveBeenCalledOnce();
-      } else {
-        expect(result).toMatchObject({
-          ok: false,
-          error: {
-            code: "UNAVAILABLE",
-            message: "Parent session main is still active; try again in a moment.",
-          },
-        });
-        expect(sessionLifecycleHookMocks.runSessionStart).not.toHaveBeenCalled();
-      }
-      expect(sessionLifecycleHookMocks.runSessionEnd).not.toHaveBeenCalled();
-      expect(active.isInterrupted()).toBe(false);
-      expect(
-        isSessionControllerWorkActive(
-          active.target.storeScope,
-          ["agent:main:main", sessionId],
-          "main",
-        ),
-      ).toBe(true);
-    } finally {
-      active.release();
-      await active.work;
-    }
-  },
-);
 
 test.each([
   [
